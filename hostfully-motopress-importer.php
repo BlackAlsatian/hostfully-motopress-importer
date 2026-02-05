@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer (Temporary)
  * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.24
+ * Version: 0.34
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -98,6 +98,7 @@ function hostfully_mphb_default_settings(): array
         'max_photos' => 8,
         'bulk_limit' => 10,
         'api_page_limit' => 100,
+        'include_inactive_properties' => 0,
         'allow_enrich_api' => 0,
         'amenities_cache_hours' => 24,
         'verbose_log' => 0,
@@ -123,6 +124,7 @@ function hostfully_mphb_update_settings(array $new): void
         'max_photos' => max(0, (int)($new['max_photos'] ?? $defaults['max_photos'])),
         'bulk_limit' => max(1, (int)($new['bulk_limit'] ?? $defaults['bulk_limit'])),
         'api_page_limit' => min(100, max(1, (int)($new['api_page_limit'] ?? ($defaults['api_page_limit'] ?? 100)))),
+        'include_inactive_properties' => !empty($new['include_inactive_properties']) ? 1 : 0,
 
         // Progressive enrichment toggles
         'allow_enrich_api' => !empty($new['allow_enrich_api']) ? 1 : 0,
@@ -188,22 +190,71 @@ function hostfully_mphb_api_get_json(string $url, array &$headers = [], int &$st
     return $data;
 }
 
+function hostfully_mphb_extract_cursor_from_url(string $url): string
+{
+    $parts = wp_parse_url($url);
+    if (empty($parts['query'])) return '';
+    parse_str($parts['query'], $query);
+    $cursor = $query['_cursor'] ?? $query['cursor'] ?? '';
+    return is_string($cursor) ? trim($cursor) : '';
+}
+
 function hostfully_mphb_extract_next_cursor(array $data, array $headers): string
 {
     // Common header candidates (best-effort)
-    foreach (['x-next-cursor', 'x-nextcursor', 'next-cursor', 'x-cursor-next', 'x-next-page-cursor'] as $hk) {
+    foreach ([
+        'x-next-cursor',
+        'x-nextcursor',
+        'next-cursor',
+        'x-cursor-next',
+        'x-next-page-cursor',
+        'x-next-page',
+        'x-next-pagecursor',
+        'x-hostfully-next-cursor',
+    ] as $hk) {
         if (!empty($headers[$hk])) return trim((string) $headers[$hk]);
+    }
+
+    // RFC5988 Link header: <...>; rel="next"
+    if (!empty($headers['link']) && is_string($headers['link'])) {
+        $links = explode(',', $headers['link']);
+        foreach ($links as $link) {
+            if (stripos($link, 'rel="next"') === false) continue;
+            if (preg_match('/<([^>]+)>/', $link, $m)) {
+                $cursor = hostfully_mphb_extract_cursor_from_url($m[1]);
+                if ($cursor !== '') return $cursor;
+            }
+        }
     }
 
     // Common body candidates (best-effort)
     foreach ([
         $data['nextCursor'] ?? null,
         $data['next_cursor'] ?? null,
+        $data['_metadata']['nextCursor'] ?? null,
+        $data['_metadata']['next_cursor'] ?? null,
+        $data['_metadata']['next'] ?? null,
+        $data['_metadata']['cursor'] ?? null,
         $data['cursor']['next'] ?? null,
         $data['pagination']['nextCursor'] ?? null,
+        $data['pagination']['next'] ?? null,
+        $data['paging']['nextCursor'] ?? null,
+        $data['links']['next']['cursor'] ?? null,
         $data['extensions']['nextCursor'] ?? null, // documented for GraphQL responses, but sometimes appears elsewhere
     ] as $candidate) {
         if (is_string($candidate) && $candidate !== '') return trim($candidate);
+    }
+
+    // Body may include next URL directly.
+    foreach ([
+        $data['links']['next'] ?? null,
+        $data['_metadata']['nextLink'] ?? null,
+        $data['pagination']['nextLink'] ?? null,
+    ] as $candidate) {
+        if (is_string($candidate) && $candidate !== '') {
+            $cursor = hostfully_mphb_extract_cursor_from_url($candidate);
+            if ($cursor !== '') return $cursor;
+        }
     }
 
     return '';
@@ -214,61 +265,177 @@ function hostfully_mphb_extract_next_cursor(array $data, array $headers): string
  * DATA HELPERS
  * =========
  */
-function hostfully_mphb_get_properties(): array
+function hostfully_mphb_get_properties_with_log(array &$log): array
 {
     $cfg = hostfully_mphb_settings();
     if (empty($cfg['agency_uid'])) return [];
 
     $base = rtrim($cfg['base_url'], '/') . '/properties';
-
+    $verbose = !empty($cfg['verbose_log']);
+    $include_inactive = !empty($cfg['include_inactive_properties']);
     // Hostfully V3 uses cursor pagination (`_limit`, `_cursor`) on paginated endpoints. 
     $limit  = min(100, max(1, (int)($cfg['api_page_limit'] ?? 100)));
-    $cursor = '';
     $all    = [];
     $seen   = []; // dedupe by uid, just in case
 
-    // Hard safety limit: 500 pages (way more than you’ll ever need for 109 properties)
-    for ($i = 0; $i < 500; $i++) {
-        $url = add_query_arg([
-            'agencyUid' => $cfg['agency_uid'],
-            '_limit'    => $limit,
-        ], $base);
+    $statuses = ['ACTIVE'];
+    if ($include_inactive) {
+        // Try common status filters. Dedupe by uid across all.
+        $statuses = ['ACTIVE', 'INACTIVE', 'ARCHIVED', 'DELETED', 'DISABLED', 'DRAFT', 'ALL'];
+    }
 
-        if ($cursor !== '') {
-            $url = add_query_arg(['_cursor' => $cursor], $url);
-        }
+    $status_summaries = [];
 
-        $headers = [];
-        $status  = 0;
-        $raw     = '';
-        $data = hostfully_mphb_api_get_json($url, $headers, $status, $raw);
+    foreach ($statuses as $status_filter) {
+        $cursor = '';
+        $offset = 0;
+        $status_item_count = 0;
+        $status_first_uid = '';
 
-        if (is_wp_error($data)) {
-            // Fail closed: return whatever we got so far, instead of bricking the UI.
-            return $all;
-        }
+        // Hard safety limit: 500 pages per status
+        for ($i = 0; $i < 500; $i++) {
+            $url = add_query_arg([
+                'agencyUid' => $cfg['agency_uid'],
+                '_limit'    => $limit,
+            ], $base);
+            if ($include_inactive) {
+                $url = add_query_arg([
+                    'includeInactive' => 'true',
+                ], $url);
+            }
+            if (!empty($status_filter) && $status_filter !== 'ACTIVE') {
+                $url = add_query_arg(['status' => $status_filter], $url);
+            } elseif ($include_inactive && $status_filter === 'ALL') {
+                $url = add_query_arg(['status' => 'ALL'], $url);
+            }
 
-        $page = $data['properties'] ?? [];
-        if (!is_array($page) || empty($page)) {
+            if ($cursor !== '') {
+                $url = add_query_arg(['_cursor' => $cursor], $url);
+            } elseif ($offset > 0) {
+                $url = add_query_arg(['_offset' => $offset], $url);
+            }
+
+            $headers = [];
+            $status  = 0;
+            $raw     = '';
+            $data = hostfully_mphb_api_get_json($url, $headers, $status, $raw);
+
+            if (is_wp_error($data)) {
+                if ($verbose) {
+                    $log[] = 'Properties fetch failed: ' . $data->get_error_message();
+                    $log[] = 'Properties URL: ' . $url . ' (HTTP ' . $status . ')';
+                }
+                break;
+            }
+
+            $page = $data['properties'] ?? $data['items'] ?? [];
+            if (!is_array($page) || empty($page)) {
+                if ($verbose && $i === 0) {
+                    $log[] = 'Properties fetch returned empty page for status ' . $status_filter . '.';
+                }
+                break;
+            }
+
+            $next_cursor = hostfully_mphb_extract_next_cursor($data, $headers);
+            if ($verbose) {
+                if ($i === 0) {
+                    $meta_count = $data['_metadata']['count'] ?? null;
+                    $meta_total = $data['_metadata']['totalCount'] ?? null;
+                    if ($meta_count !== null || $meta_total !== null) {
+                        $log[] = 'Properties metadata (' . $status_filter . '): count ' . (string)$meta_count . ', totalCount ' . (string)$meta_total;
+                    }
+                }
+                $log[] = sprintf(
+                    'Properties page %d (%s): HTTP %d, items %d, next_cursor %s, offset %d',
+                    $i + 1,
+                    $status_filter,
+                    $status,
+                    count($page),
+                    $next_cursor !== '' ? $next_cursor : '(none)',
+                    $offset
+                );
+            }
+
+            $status_item_count += count($page);
+            if ($status_first_uid === '') {
+                $first = $page[0] ?? null;
+                if (is_array($first) && !empty($first['uid'])) {
+                    $status_first_uid = (string)$first['uid'];
+                }
+            }
+
+            foreach ($page as $p) {
+                $uid = (string)($p['uid'] ?? '');
+                if (!$uid || isset($seen[$uid])) continue;
+                $seen[$uid] = true;
+                $all[] = $p;
+            }
+
+            if ($next_cursor !== '' && $next_cursor !== $cursor) {
+                $cursor = $next_cursor;
+                $offset = 0;
+                continue;
+            }
+
+            if (count($page) >= $limit) {
+                $offset += $limit;
+                continue;
+            }
+
             break;
         }
 
-        foreach ($page as $p) {
-            $uid = (string)($p['uid'] ?? '');
-            if (!$uid || isset($seen[$uid])) continue;
-            $seen[$uid] = true;
-            $all[] = $p;
+        if ($verbose) {
+            $log[] = sprintf(
+                'Status filter %s summary: items %d, first_uid %s',
+                $status_filter,
+                $status_item_count,
+                $status_first_uid !== '' ? $status_first_uid : '(none)'
+            );
         }
 
-        $next = hostfully_mphb_extract_next_cursor($data, $headers);
-        if ($next === '' || $next === $cursor) {
-            break;
-        }
+        $status_summaries[] = [
+            'status' => $status_filter,
+            'items' => $status_item_count,
+            'first_uid' => $status_first_uid,
+        ];
+    }
 
-        $cursor = $next;
+    if ($verbose && $include_inactive && count($status_summaries) > 1) {
+        $baseline = $status_summaries[0];
+        $all_same = true;
+        foreach ($status_summaries as $s) {
+            if ($s['items'] !== $baseline['items'] || $s['first_uid'] !== $baseline['first_uid']) {
+                $all_same = false;
+                break;
+            }
+        }
+        if ($all_same) {
+            $log[] = 'Warning: status filters appear to be ignored by the Hostfully API (responses look identical).';
+        }
     }
 
     return $all;
+}
+
+function hostfully_mphb_extract_uuids(string $input): array
+{
+    if ($input === '') return [];
+    $matches = [];
+    preg_match_all('/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/', $input, $matches);
+    if (empty($matches[0])) return [];
+    $uniq = [];
+    foreach ($matches[0] as $uid) {
+        $uid = strtolower($uid);
+        if (!isset($uniq[$uid])) $uniq[$uid] = true;
+    }
+    return array_keys($uniq);
+}
+
+function hostfully_mphb_get_properties(): array
+{
+    $log = [];
+    return hostfully_mphb_get_properties_with_log($log);
 }
 
 
@@ -2360,6 +2527,15 @@ function hostfully_mphb_render_admin()
                     <td><input id="hostfully_bulk_limit" type="number" min="1" name="hostfully[bulk_limit]" value="<?= esc_attr($cfg['bulk_limit']); ?>" style="width:120px;"></td>
                 </tr>
                 <tr>
+                    <th scope="row">Include inactive properties</th>
+                    <td>
+                        <label>
+                            <input type="checkbox" name="hostfully[include_inactive_properties]" value="1" <?= !empty($cfg['include_inactive_properties']) ? 'checked' : ''; ?>>
+                            Include inactive/archived properties when fetching from Hostfully
+                        </label>
+                    </td>
+                </tr>
+                <tr>
                     <th scope="row">API enrichment</th>
                     <td>
                         <label style="display:block; margin:4px 0 6px;">
@@ -2451,6 +2627,37 @@ function hostfully_mphb_render_admin()
             <div id="hostfully-summary" style="display:none; margin-top:10px; padding:8px; background:#f6f7f7; border:1px solid #ccd0d4;"></div>
         </div>
         <p id="hostfully-js-indicator" style="margin-top:8px; color:#666; font-size:12px;">JS status: not loaded</p>
+
+        <hr>
+
+        <h2>Step 5: Import by UID List (When API Listing Is Incomplete)</h2>
+        <p>If Hostfully’s property list doesn’t return everything, paste a list of property UIDs below (from a Hostfully export or UI copy). We’ll import only those UIDs.</p>
+        <form id="hostfully-uid-import-form">
+            <?php wp_nonce_field('hostfully_mphb_import_uids'); ?>
+            <p>
+                <label for="hostfully_uid_list"><strong>Property UIDs (one per line or CSV)</strong></label><br>
+                <textarea id="hostfully_uid_list" name="uids_raw" rows="5" style="width:620px; max-width:100%;"></textarea>
+            </p>
+            <p>
+                <button class="button" id="hostfully-uid-compare">Compare & Show Missing</button>
+                <span style="margin-left:6px; color:#666;">Compares pasted UIDs vs already-imported ones.</span>
+            </p>
+            <p>
+                <label for="hostfully_uid_missing"><strong>Missing UIDs (not imported yet)</strong></label><br>
+                <textarea id="hostfully_uid_missing" rows="5" style="width:620px; max-width:100%;" readonly></textarea>
+            </p>
+            <p>
+                <button class="button" id="hostfully-uid-use-missing">Use Missing as Import List</button>
+            </p>
+            <p>
+                <label>
+                    <input type="checkbox" id="hostfully-uid-update-existing" value="1"> Update existing imports too
+                </label>
+            </p>
+            <p>
+                <button class="button button-primary" id="hostfully-uid-start">Import UIDs</button>
+            </p>
+        </form>
     </div>
 <?php
 }
@@ -2505,7 +2712,8 @@ add_action('wp_ajax_hostfully_mphb_bulk_start', function () {
     check_ajax_referer('hostfully_mphb_ajax', 'nonce');
 
     $cfg = hostfully_mphb_settings();
-    $properties = hostfully_mphb_get_properties();
+    $start_log = [];
+    $properties = hostfully_mphb_get_properties_with_log($start_log);
     $imported   = hostfully_mphb_get_imported_uids();
 
     $update_existing = !empty($_POST['update_existing']);
@@ -2536,8 +2744,73 @@ add_action('wp_ajax_hostfully_mphb_bulk_start', function () {
     wp_send_json_success([
         'total' => $progress['total'],
         'queue' => $missing,
+        'properties_total' => count($properties),
         'update_existing' => $update_existing,
         'last_error' => hostfully_mphb_get_last_error(),
+        'log' => $start_log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_uid_queue_start', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $raw = (string)($_POST['uids_raw'] ?? '');
+    $uids = hostfully_mphb_extract_uuids($raw);
+    if (empty($uids)) {
+        wp_send_json_error(['message' => 'No valid UIDs found. Paste Hostfully UIDs (one per line or CSV).'], 400);
+    }
+
+    $update_existing = !empty($_POST['update_existing']);
+    $imported = hostfully_mphb_get_imported_uids();
+
+    $queue = [];
+    $skipped_existing = 0;
+
+    foreach ($uids as $uid) {
+        if (!$update_existing && in_array($uid, $imported, true)) {
+            $skipped_existing++;
+            continue;
+        }
+        $queue[] = $uid;
+    }
+
+    update_option(HOSTFULLY_MPHB_OPT_QUEUE, $queue, false);
+
+    $progress = [
+        'total'      => count($queue),
+        'done'       => 0,
+        'last'       => null,
+        'errors'     => 0,
+        'created'    => 0,
+        'updated'    => 0,
+        'started_at' => time(),
+    ];
+    update_option(HOSTFULLY_MPHB_OPT_PROGRESS, $progress, false);
+
+    $log = [];
+    $log[] = 'UID list parsed: ' . count($uids);
+    if ($skipped_existing > 0) {
+        $log[] = 'Skipped already-imported UIDs: ' . $skipped_existing;
+    }
+    if (empty($queue)) {
+        $log[] = 'Nothing to import after filtering.';
+    }
+
+    wp_send_json_success([
+        'total' => $progress['total'],
+        'queue' => $queue,
+        'last_error' => hostfully_mphb_get_last_error(),
+        'log' => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_get_imported_uids', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+    $imported = hostfully_mphb_get_imported_uids();
+    wp_send_json_success([
+        'uids' => array_values($imported),
     ]);
 });
 

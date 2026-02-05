@@ -33,6 +33,13 @@
     : null;
   const importOneStatus = document.getElementById('hostfully-import-one-status');
   const importOneSpinner = document.getElementById('hostfully-import-one-spinner');
+  const uidForm = document.getElementById('hostfully-uid-import-form');
+  const uidTextarea = document.getElementById('hostfully_uid_list');
+  const uidMissingTextarea = document.getElementById('hostfully_uid_missing');
+  const uidStartBtn = document.getElementById('hostfully-uid-start');
+  const uidUpdateExisting = document.getElementById('hostfully-uid-update-existing');
+  const uidCompareBtn = document.getElementById('hostfully-uid-compare');
+  const uidUseMissingBtn = document.getElementById('hostfully-uid-use-missing');
 
   function refreshImportedOptions() {
     if (!propertySelect) return;
@@ -268,7 +275,14 @@
     }
 
     const total = (r.data && r.data.total) || 0;
-    appendLog([`Queue prepared. Total to import: ${total}`]);
+    const propertiesTotal = (r.data && r.data.properties_total) || 0;
+    if (r.data && Array.isArray(r.data.log) && r.data.log.length) {
+      appendLog(r.data.log);
+    }
+    appendLog([
+      `Properties fetched: ${propertiesTotal}`,
+      `Queue prepared. Total to import: ${total}`,
+    ]);
     if (r.data && r.data.last_error) logLastError(r.data.last_error);
 
     if (total === 0) {
@@ -389,6 +403,131 @@
       }
       if (importOneSpinner) importOneSpinner.classList.remove('is-active');
       if (importOneBtn) importOneBtn.disabled = false;
+    });
+  }
+
+  if (uidForm && uidStartBtn && uidTextarea) {
+    if (uidCompareBtn) {
+      uidCompareBtn.addEventListener('click', async function (e) {
+        e.preventDefault();
+        const raw = uidTextarea.value || '';
+        if (!raw.trim()) {
+          showError('UID compare', new Error('Please paste at least one Hostfully property UID.'));
+          return;
+        }
+        let r = null;
+        try {
+          r = await post('hostfully_mphb_get_imported_uids');
+          if (r && r.success) markJsOk();
+        } catch (err) {
+          showError('UID compare failed', err);
+          return;
+        }
+        if (!r || !r.success) {
+          appendLog(['UID compare failed.', JSON.stringify(r)]);
+          return;
+        }
+        const imported = new Set((r.data && r.data.uids) || []);
+        const pasted = [];
+        const re = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+        const matches = raw.match(re) || [];
+        const seen = new Set();
+        matches.forEach((uid) => {
+          const lower = uid.toLowerCase();
+          if (!seen.has(lower)) {
+            seen.add(lower);
+            pasted.push(lower);
+          }
+        });
+
+        const missing = pasted.filter((uid) => !imported.has(uid));
+        if (uidMissingTextarea) {
+          uidMissingTextarea.value = missing.join('\n');
+        }
+        appendLog([
+          `UID compare: pasted ${pasted.length}, imported ${imported.size}, missing ${missing.length}`,
+        ]);
+      });
+    }
+
+    if (uidUseMissingBtn && uidMissingTextarea) {
+      uidUseMissingBtn.addEventListener('click', function (e) {
+        e.preventDefault();
+        const missing = uidMissingTextarea.value || '';
+        if (missing.trim()) {
+          uidTextarea.value = missing.trim();
+        }
+      });
+    }
+
+    uidForm.addEventListener('submit', async function (e) {
+      e.preventDefault();
+      const raw = uidTextarea.value || '';
+      if (!raw.trim()) {
+        showError('UID import', new Error('Please paste at least one Hostfully property UID.'));
+        return;
+      }
+
+      stopped = false;
+      wrap.style.display = 'block';
+      logEl.textContent = '';
+      setBusy(true);
+      resetCounter();
+      if (summaryEl) {
+        summaryEl.textContent = '';
+        summaryEl.style.display = 'none';
+      }
+      statusEl.textContent = 'Preparing UID queue…';
+
+      uidStartBtn.disabled = true;
+      stopBtn.disabled = false;
+      startBtn.disabled = true;
+
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_uid_queue_start', {
+          uids_raw: raw,
+          update_existing: uidUpdateExisting && uidUpdateExisting.checked ? '1' : '0',
+        });
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('UID queue start failed', err);
+        uidStartBtn.disabled = false;
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        return;
+      }
+
+      if (!r || !r.success) {
+        statusEl.textContent = 'Error';
+        setBusy(false);
+        resetCounter();
+        appendLog(['UID queue start failed.', JSON.stringify(r)]);
+        uidStartBtn.disabled = false;
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        return;
+      }
+
+      const total = (r.data && r.data.total) || 0;
+      if (r.data && Array.isArray(r.data.log) && r.data.log.length) {
+        appendLog(r.data.log);
+      }
+      appendLog([`Queue prepared. Total to import: ${total}`]);
+      if (r.data && r.data.last_error) logLastError(r.data.last_error);
+
+      if (total === 0) {
+        statusEl.textContent = 'Nothing to import.';
+        setBusy(false);
+        resetCounter();
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        uidStartBtn.disabled = false;
+        return;
+      }
+
+      await tickLoop();
+      uidStartBtn.disabled = false;
     });
   }
 
