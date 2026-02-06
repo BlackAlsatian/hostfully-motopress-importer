@@ -15,6 +15,8 @@ This plugin pulls Hostfully properties into MotoPress Hotel Booking (WordPress) 
 - Ensures an “All Year” season exists and writes season prices so rates display in the UI.
 - Bulk import via AJAX with progress logging, verbose mode, and summary.
 - Single import for testing with the same log panel and spinner.
+- Import by UID list when the Hostfully property list endpoint is incomplete.
+- Compare pasted UIDs to already-imported ones and isolate missing entries.
 
 ## Requirements
 - WordPress 6.x
@@ -41,6 +43,7 @@ Go to **Hostfully Import** in WP Admin and set:
 2. **Sync Amenities Catalog** once (recommended).
 3. **Import One** to verify configuration and output.
 4. **Bulk Import** to process all remaining properties.
+5. **Import by UID List** when Hostfully’s property list is incomplete. Use “Compare & Show Missing” to find what’s not yet imported.
 
 ## How Pricing Is Stored
 MotoPress rates use **season prices** to display in the UI. If no seasons exist, the importer auto-creates an **All Year** season and writes a base price there. This ensures rates show up immediately in the Rates screen without manual setup.
@@ -55,6 +58,7 @@ MotoPress rates use **season prices** to display in the UI. If no seasons exist,
 - Import is **idempotent**: re-running will update existing items unless you choose otherwise.
 - iCal sync is not required for importing properties and rates.
 - Availability sync can be handled separately via MotoPress + external iCal setup.
+- If Hostfully’s `/properties` list does not return all properties, use the **Import by UID List** tool to fill the gaps.
 
 ## Troubleshooting
 If something looks off:
@@ -64,4 +68,3 @@ If something looks off:
 
 ## License
 MIT — see `LICENSE`.
-
