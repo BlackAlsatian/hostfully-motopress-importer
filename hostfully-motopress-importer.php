@@ -538,6 +538,48 @@ function hostfully_mphb_fetch_property_descriptions(string $property_uid, array 
     ];
 }
 
+function hostfully_mphb_fetch_property_icals(string $property_uid, array &$log): array
+{
+    $cfg = hostfully_mphb_settings();
+    $url = rtrim($cfg['base_url'], '/') . '/icals';
+    $url = add_query_arg(['propertyUid' => $property_uid], $url);
+
+    $headers = [];
+    $status = 0;
+    $raw = '';
+    $data = hostfully_mphb_api_get_json($url, $headers, $status, $raw);
+    if (is_wp_error($data)) {
+        $log[] = 'ICals fetch failed for ' . $property_uid . ': ' . $data->get_error_message();
+        return [];
+    }
+
+    if (!is_array($data)) return [];
+    if (!empty($data['icals']) && is_array($data['icals'])) return $data['icals'];
+    if (!empty($data['items']) && is_array($data['items'])) return $data['items'];
+    return [];
+}
+
+function hostfully_mphb_fetch_property_channel_links(string $property_uid, array &$log): array
+{
+    $cfg = hostfully_mphb_settings();
+    $url = rtrim($cfg['base_url'], '/') . '/property-channel-links';
+    $url = add_query_arg(['propertyUid' => $property_uid], $url);
+
+    $headers = [];
+    $status = 0;
+    $raw = '';
+    $data = hostfully_mphb_api_get_json($url, $headers, $status, $raw);
+    if (is_wp_error($data)) {
+        $log[] = 'Channel links fetch failed for ' . $property_uid . ': ' . $data->get_error_message();
+        return [];
+    }
+
+    if (!is_array($data)) return [];
+    if (!empty($data['propertyChannelLinks']) && is_array($data['propertyChannelLinks'])) return $data['propertyChannelLinks'];
+    if (!empty($data['items']) && is_array($data['items'])) return $data['items'];
+    return [];
+}
+
 function hostfully_mphb_update_text_meta(int $post_id, string $key, $value): void
 {
     $val = is_string($value) ? trim($value) : '';
@@ -3347,6 +3389,24 @@ function hostfully_mphb_render_admin()
 
         <hr>
 
+        <details id="hostfully-step-ical" data-step="hostfully-step-ical">
+            <summary><strong>Step 7: iCal Links Audit (Channel Links vs Feeds)</strong></summary>
+            <div style="margin-top:8px;">
+                <p>Checks which properties have channel links (Airbnb/Booking) and whether Hostfully returns any iCal feeds for them.</p>
+                <p>
+                    <label for="hostfully-ical-report-limit" style="margin-right:8px;">Max properties to scan</label>
+                    <input id="hostfully-ical-report-limit" type="number" min="1" max="200" value="50" style="width:120px;">
+                    <button id="hostfully-ical-report-run" class="button" style="margin-left:8px;">Run iCal Audit</button>
+                    <span id="hostfully-ical-report-status" style="margin-left:8px; color:#666;"></span>
+                    <span id="hostfully-ical-report-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                </p>
+                <div id="hostfully-ical-report-table" style="margin-top:10px;"></div>
+                <pre id="hostfully-ical-report-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
+            </div>
+        </details>
+
+        <hr>
+
         <details id="hostfully-step-meta" data-step="hostfully-step-meta">
             <summary><strong>Reference: Elementor Meta Helper</strong></summary>
             <div style="margin-top:8px;">
@@ -3844,6 +3904,62 @@ add_action('wp_ajax_hostfully_mphb_get_last_error', function () {
 
     wp_send_json_success([
         'last_error' => hostfully_mphb_get_last_error(),
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_ical_report', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $limit = isset($_POST['limit']) ? (int)$_POST['limit'] : 50;
+    if ($limit < 1) $limit = 1;
+    if ($limit > 200) $limit = 200;
+
+    $log = [];
+    $properties = hostfully_mphb_get_property_list_cached($log);
+    $properties = array_slice($properties, 0, $limit);
+
+    $items = [];
+    foreach ($properties as $p) {
+        if (!is_array($p) || empty($p['uid'])) continue;
+        $uid = (string)$p['uid'];
+        $name = (string)($p['name'] ?? 'Unnamed property');
+
+        $links = hostfully_mphb_fetch_property_channel_links($uid, $log);
+        $icals = hostfully_mphb_fetch_property_icals($uid, $log);
+
+        $channels = [];
+        foreach ($links as $link) {
+            if (!is_array($link)) continue;
+            if (!empty($link['channel'])) $channels[] = (string)$link['channel'];
+        }
+        $channels = array_values(array_unique(array_filter($channels)));
+
+        $ical_urls = [];
+        foreach ($icals as $ical) {
+            if (!is_array($ical)) continue;
+            foreach (['url', 'icalUrl', 'importUrl', 'exportUrl', 'link'] as $key) {
+                if (!empty($ical[$key]) && is_string($ical[$key])) {
+                    $ical_urls[] = $ical[$key];
+                }
+            }
+        }
+        $ical_urls = array_values(array_unique(array_filter($ical_urls)));
+
+        $items[] = [
+            'uid' => $uid,
+            'name' => $name,
+            'channels' => $channels,
+            'ical_count' => count($icals),
+            'ical_urls' => $ical_urls,
+            'needs_setup' => !empty($channels) && empty($icals),
+        ];
+    }
+
+    wp_send_json_success([
+        'items' => $items,
+        'count' => count($items),
+        'log' => $log,
     ]);
 });
 

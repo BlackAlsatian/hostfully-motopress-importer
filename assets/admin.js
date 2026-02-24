@@ -46,6 +46,12 @@
   const uidUpdateExisting = document.getElementById('hostfully-uid-update-existing');
   const uidCompareBtn = document.getElementById('hostfully-uid-compare');
   const uidUseMissingBtn = document.getElementById('hostfully-uid-use-missing');
+  const icalReportBtn = document.getElementById('hostfully-ical-report-run');
+  const icalReportLimit = document.getElementById('hostfully-ical-report-limit');
+  const icalReportStatus = document.getElementById('hostfully-ical-report-status');
+  const icalReportSpinner = document.getElementById('hostfully-ical-report-spinner');
+  const icalReportTable = document.getElementById('hostfully-ical-report-table');
+  const icalReportLog = document.getElementById('hostfully-ical-report-log');
   const migrateBtn = document.getElementById('hostfully-migrate-start');
   const cleanupBtn = document.getElementById('hostfully-cleanup-terms');
   const wrapEl = document.querySelector('.wrap[data-next-action]');
@@ -126,6 +132,74 @@
     } else {
       loadPropertiesSpinner.classList.remove('is-active');
     }
+  }
+
+  function setIcalReportBusy(isBusy) {
+    if (!icalReportSpinner) return;
+    if (isBusy) {
+      icalReportSpinner.classList.add('is-active');
+    } else {
+      icalReportSpinner.classList.remove('is-active');
+    }
+  }
+
+  function renderIcalReport(items) {
+    if (!icalReportTable) return;
+    icalReportTable.innerHTML = '';
+
+    const table = document.createElement('table');
+    table.className = 'widefat fixed striped';
+    table.style.maxWidth = '900px';
+
+    const thead = document.createElement('thead');
+    thead.innerHTML =
+      '<tr>' +
+      '<th style="width:240px;">Property</th>' +
+      '<th style="width:280px;">UID</th>' +
+      '<th>Channels</th>' +
+      '<th style="width:90px;">iCal count</th>' +
+      '<th style="width:110px;">Needs setup</th>' +
+      '</tr>';
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+
+    if (!items || !items.length) {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = 5;
+      cell.textContent = 'No properties found.';
+      row.appendChild(cell);
+      tbody.appendChild(row);
+    } else {
+      items.forEach((item) => {
+        const row = document.createElement('tr');
+        const channels = (item.channels || []).join(', ');
+        const needsSetup = item.needs_setup ? 'Yes' : 'No';
+
+        row.innerHTML =
+          '<td>' + escapeHtml(item.name || 'Unnamed') + '</td>' +
+          '<td>' + escapeHtml(item.uid || '') + '</td>' +
+          '<td>' + escapeHtml(channels || '-') + '</td>' +
+          '<td>' + escapeHtml(String(item.ical_count || 0)) + '</td>' +
+          '<td>' + escapeHtml(needsSetup) + '</td>';
+
+        tbody.appendChild(row);
+      });
+    }
+
+    table.appendChild(tbody);
+    icalReportTable.appendChild(table);
+  }
+
+  function escapeHtml(value) {
+    const text = value == null ? '' : String(value);
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   function renderPropertyOptions(items) {
@@ -209,6 +283,52 @@
     refreshPropertiesBtn.addEventListener('click', function (e) {
       e.preventDefault();
       loadProperties(true);
+    });
+  }
+
+  if (icalReportBtn) {
+    icalReportBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      const limit = icalReportLimit ? parseInt(icalReportLimit.value, 10) : 50;
+      if (icalReportStatus) icalReportStatus.textContent = 'Running…';
+      if (icalReportLog) icalReportLog.style.display = 'none';
+      setIcalReportBusy(true);
+      icalReportBtn.disabled = true;
+
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_ical_report', {
+          limit: Number.isFinite(limit) ? String(limit) : '50',
+        });
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('iCal audit failed', err);
+        if (icalReportStatus) icalReportStatus.textContent = 'Failed';
+        setIcalReportBusy(false);
+        icalReportBtn.disabled = false;
+        return;
+      }
+
+      if (!r || !r.success) {
+        showError('iCal audit failed', new Error('Unexpected response.'));
+        if (icalReportStatus) icalReportStatus.textContent = 'Failed';
+        setIcalReportBusy(false);
+        icalReportBtn.disabled = false;
+        return;
+      }
+
+      const data = r.data || {};
+      const items = data.items || [];
+      renderIcalReport(items);
+      if (icalReportStatus) {
+        icalReportStatus.textContent = `Checked ${data.count || items.length}`;
+      }
+      if (icalReportLog && data.log && data.log.length) {
+        icalReportLog.textContent = data.log.join('\n');
+        icalReportLog.style.display = 'block';
+      }
+      setIcalReportBusy(false);
+      icalReportBtn.disabled = false;
     });
   }
 
