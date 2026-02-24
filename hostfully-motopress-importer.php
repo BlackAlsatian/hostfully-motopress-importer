@@ -202,16 +202,18 @@ function hostfully_mphb_extract_cursor_from_url(string $url): string
 function hostfully_mphb_extract_next_cursor(array $data, array $headers): string
 {
     // Common header candidates (best-effort)
-    foreach ([
-        'x-next-cursor',
-        'x-nextcursor',
-        'next-cursor',
-        'x-cursor-next',
-        'x-next-page-cursor',
-        'x-next-page',
-        'x-next-pagecursor',
-        'x-hostfully-next-cursor',
-    ] as $hk) {
+    foreach (
+        [
+            'x-next-cursor',
+            'x-nextcursor',
+            'next-cursor',
+            'x-cursor-next',
+            'x-next-page-cursor',
+            'x-next-page',
+            'x-next-pagecursor',
+            'x-hostfully-next-cursor',
+        ] as $hk
+    ) {
         if (!empty($headers[$hk])) return trim((string) $headers[$hk]);
     }
 
@@ -228,29 +230,33 @@ function hostfully_mphb_extract_next_cursor(array $data, array $headers): string
     }
 
     // Common body candidates (best-effort)
-    foreach ([
-        $data['nextCursor'] ?? null,
-        $data['next_cursor'] ?? null,
-        $data['_metadata']['nextCursor'] ?? null,
-        $data['_metadata']['next_cursor'] ?? null,
-        $data['_metadata']['next'] ?? null,
-        $data['_metadata']['cursor'] ?? null,
-        $data['cursor']['next'] ?? null,
-        $data['pagination']['nextCursor'] ?? null,
-        $data['pagination']['next'] ?? null,
-        $data['paging']['nextCursor'] ?? null,
-        $data['links']['next']['cursor'] ?? null,
-        $data['extensions']['nextCursor'] ?? null, // documented for GraphQL responses, but sometimes appears elsewhere
-    ] as $candidate) {
+    foreach (
+        [
+            $data['nextCursor'] ?? null,
+            $data['next_cursor'] ?? null,
+            $data['_metadata']['nextCursor'] ?? null,
+            $data['_metadata']['next_cursor'] ?? null,
+            $data['_metadata']['next'] ?? null,
+            $data['_metadata']['cursor'] ?? null,
+            $data['cursor']['next'] ?? null,
+            $data['pagination']['nextCursor'] ?? null,
+            $data['pagination']['next'] ?? null,
+            $data['paging']['nextCursor'] ?? null,
+            $data['links']['next']['cursor'] ?? null,
+            $data['extensions']['nextCursor'] ?? null, // documented for GraphQL responses, but sometimes appears elsewhere
+        ] as $candidate
+    ) {
         if (is_string($candidate) && $candidate !== '') return trim($candidate);
     }
 
     // Body may include next URL directly.
-    foreach ([
-        $data['links']['next'] ?? null,
-        $data['_metadata']['nextLink'] ?? null,
-        $data['pagination']['nextLink'] ?? null,
-    ] as $candidate) {
+    foreach (
+        [
+            $data['links']['next'] ?? null,
+            $data['_metadata']['nextLink'] ?? null,
+            $data['pagination']['nextLink'] ?? null,
+        ] as $candidate
+    ) {
         if (is_string($candidate) && $candidate !== '') {
             $cursor = hostfully_mphb_extract_cursor_from_url($candidate);
             if ($cursor !== '') return $cursor;
