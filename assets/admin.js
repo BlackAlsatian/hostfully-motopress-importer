@@ -25,8 +25,14 @@
 
 
   const bulkUpdateExisting = document.getElementById('hostfully-bulk-update-existing');
+  const bulkUpdateSlugs = document.getElementById('hostfully-bulk-update-slugs');
   const updateExistingOne = document.querySelector('input[name="update_existing"]');
   const propertySelect = document.querySelector('select[name="property_uid"]');
+  const propertySelectEl = document.getElementById('hostfully-property-select');
+  const loadPropertiesBtn = document.getElementById('hostfully-load-properties');
+  const refreshPropertiesBtn = document.getElementById('hostfully-refresh-properties');
+  const loadPropertiesStatus = document.getElementById('hostfully-load-properties-status');
+  const loadPropertiesSpinner = document.getElementById('hostfully-load-properties-spinner');
   const importOneForm = document.getElementById('hostfully-import-one-form');
   const importOneBtn = importOneForm
     ? importOneForm.querySelector('button[name="hostfully_import_one"]')
@@ -40,6 +46,12 @@
   const uidUpdateExisting = document.getElementById('hostfully-uid-update-existing');
   const uidCompareBtn = document.getElementById('hostfully-uid-compare');
   const uidUseMissingBtn = document.getElementById('hostfully-uid-use-missing');
+  const migrateBtn = document.getElementById('hostfully-migrate-start');
+  const cleanupBtn = document.getElementById('hostfully-cleanup-terms');
+  const wrapEl = document.querySelector('.wrap[data-next-action]');
+  const nextActionStep = wrapEl ? wrapEl.getAttribute('data-next-action') : '';
+  const detailEls = document.querySelectorAll('details[data-step]');
+  const detailStorageKey = 'hostfully_mphb_details';
 
   function refreshImportedOptions() {
     if (!propertySelect) return;
@@ -55,6 +67,194 @@
     updateExistingOne.addEventListener('change', refreshImportedOptions);
   }
   refreshImportedOptions();
+
+  let propertiesLoaded = false;
+  let loadingProperties = false;
+  let toastTimer = null;
+  function ensureToast() {
+    let toast = document.getElementById('hostfully-toast');
+    if (toast) return toast;
+
+    toast = document.createElement('div');
+    toast.id = 'hostfully-toast';
+    toast.className = 'notice is-dismissible';
+    toast.style.position = 'fixed';
+    toast.style.right = '20px';
+    toast.style.bottom = '20px';
+    toast.style.zIndex = '100000';
+    toast.style.maxWidth = '360px';
+    toast.style.boxShadow = '0 2px 8px rgba(0, 0, 0, 0.15)';
+    toast.style.display = 'none';
+
+    const msg = document.createElement('p');
+    msg.className = 'hostfully-toast-message';
+    msg.style.margin = '0.5em 1em 0.5em 0.75em';
+    toast.appendChild(msg);
+
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'notice-dismiss';
+    dismiss.addEventListener('click', function () {
+      toast.style.display = 'none';
+    });
+    const dismissText = document.createElement('span');
+    dismissText.className = 'screen-reader-text';
+    dismissText.textContent = 'Dismiss this notice.';
+    dismiss.appendChild(dismissText);
+    toast.appendChild(dismiss);
+
+    document.body.appendChild(toast);
+    return toast;
+  }
+
+  function showToast(message, type = 'success') {
+    const toast = ensureToast();
+    const msg = toast.querySelector('.hostfully-toast-message');
+    if (msg) msg.textContent = message;
+    toast.className = `notice notice-${type} is-dismissible`;
+    toast.style.display = 'block';
+    if (toastTimer) window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(function () {
+      toast.style.display = 'none';
+    }, 3500);
+  }
+
+  function setLoadPropertiesBusy(isBusy) {
+    if (!loadPropertiesSpinner) return;
+    if (isBusy) {
+      loadPropertiesSpinner.classList.add('is-active');
+    } else {
+      loadPropertiesSpinner.classList.remove('is-active');
+    }
+  }
+
+  function renderPropertyOptions(items) {
+    if (!propertySelectEl) return;
+    propertySelectEl.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = '-- Select a property --';
+    propertySelectEl.appendChild(placeholder);
+
+    items.forEach((p) => {
+      const opt = document.createElement('option');
+      opt.value = p.uid;
+      opt.textContent = p.name + (p.imported ? ' (imported)' : '');
+      if (p.imported) opt.setAttribute('data-imported', '1');
+      propertySelectEl.appendChild(opt);
+    });
+
+    propertiesLoaded = true;
+    refreshImportedOptions();
+  }
+
+  async function loadProperties(forceRefresh = false) {
+    if (loadingProperties) return;
+    loadingProperties = true;
+    setLoadPropertiesBusy(true);
+    if (loadPropertiesStatus) {
+      loadPropertiesStatus.textContent = forceRefresh ? 'Refreshing…' : 'Loading…';
+    }
+    if (loadPropertiesBtn) loadPropertiesBtn.disabled = true;
+    if (refreshPropertiesBtn) refreshPropertiesBtn.disabled = true;
+
+    let r = null;
+    try {
+      r = await post('hostfully_mphb_fetch_properties', {
+        force_refresh: forceRefresh ? '1' : '',
+      });
+      if (r && r.success) markJsOk();
+    } catch (err) {
+      showError('Load properties failed', err);
+      showToast('Failed to load properties.', 'error');
+      if (loadPropertiesStatus) loadPropertiesStatus.textContent = 'Failed';
+      if (loadPropertiesBtn) loadPropertiesBtn.disabled = false;
+      if (refreshPropertiesBtn) refreshPropertiesBtn.disabled = false;
+      setLoadPropertiesBusy(false);
+      loadingProperties = false;
+      return;
+    }
+
+    if (!r || !r.success) {
+      showError('Load properties failed', new Error('Unexpected response.'));
+      showToast('Failed to load properties.', 'error');
+      if (loadPropertiesStatus) loadPropertiesStatus.textContent = 'Failed';
+      if (loadPropertiesBtn) loadPropertiesBtn.disabled = false;
+      if (refreshPropertiesBtn) refreshPropertiesBtn.disabled = false;
+      setLoadPropertiesBusy(false);
+      loadingProperties = false;
+      return;
+    }
+
+    const items = (r.data && r.data.properties) || [];
+    renderPropertyOptions(items);
+    if (loadPropertiesStatus) {
+      loadPropertiesStatus.textContent = `${forceRefresh ? 'Refreshed' : 'Loaded'} ${items.length}`;
+    }
+    showToast(`Properties ${forceRefresh ? 'refreshed' : 'loaded'} (${items.length}).`, 'success');
+    if (loadPropertiesBtn) loadPropertiesBtn.disabled = false;
+    if (refreshPropertiesBtn) refreshPropertiesBtn.disabled = false;
+    setLoadPropertiesBusy(false);
+    loadingProperties = false;
+  }
+
+  if (loadPropertiesBtn) {
+    loadPropertiesBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      loadProperties();
+    });
+  }
+
+  if (refreshPropertiesBtn) {
+    refreshPropertiesBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      loadProperties(true);
+    });
+  }
+
+  const importOneDetails = document.getElementById('hostfully-step-one');
+  if (importOneDetails) {
+    importOneDetails.addEventListener('toggle', function () {
+      if (importOneDetails.open && !propertiesLoaded) {
+        loadProperties();
+      }
+    });
+  }
+
+  function loadDetailState() {
+    if (!detailEls.length) return;
+    let stored = null;
+    try {
+      stored = JSON.parse(localStorage.getItem(detailStorageKey) || 'null');
+    } catch (err) {
+      stored = null;
+    }
+
+    detailEls.forEach((el) => {
+      const key = el.getAttribute('data-step') || el.id;
+      if (stored && Object.prototype.hasOwnProperty.call(stored, key)) {
+        el.open = !!stored[key];
+        return;
+      }
+      el.open = nextActionStep && key === nextActionStep;
+    });
+  }
+
+  function saveDetailState() {
+    if (!detailEls.length) return;
+    const state = {};
+    detailEls.forEach((el) => {
+      const key = el.getAttribute('data-step') || el.id;
+      state[key] = !!el.open;
+    });
+    localStorage.setItem(detailStorageKey, JSON.stringify(state));
+  }
+
+  detailEls.forEach((el) => {
+    el.addEventListener('toggle', saveDetailState);
+  });
+
+  loadDetailState();
 
 
   function appendLog(lines) {
@@ -115,6 +315,34 @@
     if (err === lastErrorSeen) return;
     lastErrorSeen = err;
     appendLog([`Last error: ${err}`]);
+  }
+
+  async function copyText(value) {
+    if (!value) return false;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        return true;
+      } catch (err) {
+        // fall through
+      }
+    }
+
+    const el = document.createElement('textarea');
+    el.value = value;
+    el.setAttribute('readonly', 'readonly');
+    el.style.position = 'absolute';
+    el.style.left = '-9999px';
+    document.body.appendChild(el);
+    el.select();
+    try {
+      const ok = document.execCommand('copy');
+      document.body.removeChild(el);
+      return ok;
+    } catch (err) {
+      document.body.removeChild(el);
+      return false;
+    }
   }
 
   async function post(action, payload = {}) {
@@ -255,6 +483,7 @@
     try {
       r = await post('hostfully_mphb_bulk_start', {
         update_existing: bulkUpdateExisting && bulkUpdateExisting.checked ? '1' : '0',
+        update_slugs: bulkUpdateSlugs && bulkUpdateSlugs.checked ? '1' : '0',
       });
       if (r && r.success) markJsOk();
     } catch (err) {
@@ -297,6 +526,145 @@
     await tickLoop();
   });
 
+  if (migrateBtn) {
+    migrateBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      const ok = window.confirm('Migration will update all imported properties to apply the latest mapping rules. Continue?');
+      if (!ok) return;
+      const updateSlugsOpt = document.getElementById('hostfully-migrate-update-slugs');
+      const updateSlugs = updateSlugsOpt && updateSlugsOpt.checked ? '1' : '0';
+      stopped = false;
+      wrap.style.display = 'block';
+      logEl.textContent = '';
+      setBusy(true);
+      resetCounter();
+      if (summaryEl) {
+        summaryEl.textContent = '';
+        summaryEl.style.display = 'none';
+      }
+      statusEl.textContent = 'Preparing migration queue…';
+
+      migrateBtn.disabled = true;
+      stopBtn.disabled = false;
+      startBtn.disabled = true;
+      if (uidStartBtn) uidStartBtn.disabled = true;
+
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_migrate_start', {
+          update_slugs: updateSlugs,
+        });
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('Migration start failed', err);
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        migrateBtn.disabled = false;
+        if (uidStartBtn) uidStartBtn.disabled = false;
+        return;
+      }
+
+      if (!r || !r.success) {
+        statusEl.textContent = 'Error';
+        setBusy(false);
+        resetCounter();
+        appendLog(['Migration start failed.', JSON.stringify(r)]);
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        migrateBtn.disabled = false;
+        if (uidStartBtn) uidStartBtn.disabled = false;
+        return;
+      }
+
+      const total = (r.data && r.data.total) || 0;
+      if (r.data && Array.isArray(r.data.log) && r.data.log.length) {
+        appendLog(r.data.log);
+      }
+      appendLog([`Migration queue prepared. Total to update: ${total}`]);
+      if (r.data && r.data.last_error) logLastError(r.data.last_error);
+
+      if (total === 0) {
+        statusEl.textContent = 'Nothing to migrate.';
+        setBusy(false);
+        resetCounter();
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        migrateBtn.disabled = false;
+        if (uidStartBtn) uidStartBtn.disabled = false;
+        return;
+      }
+
+      await tickLoop();
+      migrateBtn.disabled = false;
+      if (uidStartBtn) uidStartBtn.disabled = false;
+    });
+  }
+
+  if (cleanupBtn) {
+    cleanupBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      const optTerms = document.getElementById('hostfully-cleanup-terms-opt');
+      const optRates = document.getElementById('hostfully-cleanup-orphan-rates');
+      const optRooms = document.getElementById('hostfully-cleanup-orphan-rooms');
+      const optServices = document.getElementById('hostfully-cleanup-orphan-services');
+      const optMedia = document.getElementById('hostfully-cleanup-orphan-media');
+      const optAttrReg = document.getElementById('hostfully-cleanup-attr-reg');
+      const optClearCatsTags = document.getElementById('hostfully-cleanup-clear-cats-tags');
+      const optUnpublish = document.getElementById('hostfully-unpublish-missing');
+
+      const payload = {
+        cleanup_terms: optTerms && optTerms.checked ? '1' : '0',
+        cleanup_orphan_rates: optRates && optRates.checked ? '1' : '0',
+        cleanup_orphan_rooms: optRooms && optRooms.checked ? '1' : '0',
+        cleanup_orphan_services: optServices && optServices.checked ? '1' : '0',
+        cleanup_orphan_media: optMedia && optMedia.checked ? '1' : '0',
+        cleanup_attr_reg: optAttrReg && optAttrReg.checked ? '1' : '0',
+        cleanup_clear_cats_tags: optClearCatsTags && optClearCatsTags.checked ? '1' : '0',
+        unpublish_missing: optUnpublish && optUnpublish.checked ? '1' : '0',
+      };
+
+      const anySelected = Object.values(payload).some((v) => v === '1');
+      if (!anySelected) {
+        showError('Cleanup', new Error('Select at least one cleanup option.'));
+        return;
+      }
+
+      const ok = window.confirm('Cleanup will remove or unpublish data based on the selected options. Continue?');
+      if (!ok) return;
+      wrap.style.display = 'block';
+      logEl.textContent = '';
+      setBusy(true);
+      resetCounter();
+      statusEl.textContent = 'Cleaning unused terms…';
+
+      cleanupBtn.disabled = true;
+
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_cleanup_terms', payload);
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('Cleanup failed', err);
+        cleanupBtn.disabled = false;
+        return;
+      }
+
+      if (!r || !r.success) {
+        statusEl.textContent = 'Cleanup error';
+        setBusy(false);
+        appendLog(['Cleanup failed.', JSON.stringify(r)]);
+        cleanupBtn.disabled = false;
+        return;
+      }
+
+      const d = r.data || {};
+      appendLog([...(d.log || [])]);
+      statusEl.textContent = 'Cleanup complete ✅';
+      setBusy(false);
+      cleanupBtn.disabled = false;
+    });
+  }
+
 
   const syncAmenitiesBtn = document.getElementById('hostfully-sync-amenities');
   if (syncAmenitiesBtn) {
@@ -334,6 +702,20 @@
       syncAmenitiesBtn.disabled = false;
     });
   }
+
+  document.addEventListener('click', async function (e) {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-copy]') : null;
+    if (!btn) return;
+    const val = btn.getAttribute('data-copy') || '';
+    const ok = await copyText(val);
+    const prev = btn.textContent;
+    btn.textContent = ok ? 'Copied' : 'Failed';
+    btn.disabled = true;
+    setTimeout(() => {
+      btn.textContent = prev;
+      btn.disabled = false;
+    }, 1200);
+  });
 
 
   if (importOneForm) {

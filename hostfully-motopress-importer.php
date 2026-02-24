@@ -438,6 +438,167 @@ function hostfully_mphb_get_properties(): array
     return hostfully_mphb_get_properties_with_log($log);
 }
 
+function hostfully_mphb_summarize_properties(array $properties): array
+{
+    $out = [];
+    foreach ($properties as $p) {
+        if (!is_array($p)) continue;
+        $uid = (string)($p['uid'] ?? '');
+        if ($uid === '') continue;
+        $name = (string)($p['name'] ?? 'Unnamed property');
+        $out[] = [
+            'uid' => $uid,
+            'name' => $name,
+        ];
+    }
+    return $out;
+}
+
+function hostfully_mphb_get_property_list_cached(array &$log): array
+{
+    $cfg = hostfully_mphb_settings();
+    $cache_key = 'hostfully_mphb_props_' . md5((string)($cfg['agency_uid'] ?? '') . '|' . (!empty($cfg['include_inactive_properties']) ? '1' : '0'));
+
+    $cached = get_transient($cache_key);
+    if (is_array($cached)) {
+        $log[] = 'Properties cache hit.';
+        return $cached;
+    }
+
+    $log[] = 'Properties cache miss. Fetching from Hostfully.';
+    $properties = hostfully_mphb_get_properties_with_log($log);
+    $summary = hostfully_mphb_summarize_properties($properties);
+    set_transient($cache_key, $summary, 10 * MINUTE_IN_SECONDS);
+    return $summary;
+}
+
+function hostfully_mphb_clear_property_list_cache(): void
+{
+    $cfg = hostfully_mphb_settings();
+    $cache_key = 'hostfully_mphb_props_' . md5((string)($cfg['agency_uid'] ?? '') . '|' . (!empty($cfg['include_inactive_properties']) ? '1' : '0'));
+    delete_transient($cache_key);
+}
+
+function hostfully_mphb_pick_property_description(array $items): array
+{
+    $first = [];
+    foreach ($items as $item) {
+        if (!is_array($item)) continue;
+        if (empty($first)) $first = $item;
+        $locale = (string)($item['locale'] ?? '');
+        if ($locale === 'en_US') return $item;
+    }
+    return $first;
+}
+
+function hostfully_mphb_fetch_property_descriptions(string $property_uid, array &$log): array
+{
+    if ($property_uid === '') return [];
+
+    $cfg = hostfully_mphb_settings();
+    $url = rtrim($cfg['base_url'], '/') . '/property-descriptions?propertyUid=' . urlencode($property_uid);
+
+    $headers = [];
+    $status = 0;
+    $raw = '';
+    $data = hostfully_mphb_api_get_json($url, $headers, $status, $raw);
+
+    if (is_wp_error($data)) {
+        $log[] = 'Property descriptions fetch failed: ' . $data->get_error_message();
+        return [];
+    }
+
+    $items = $data['propertyDescriptions'] ?? [];
+    if (!is_array($items) || empty($items)) {
+        $log[] = 'Property descriptions not found for ' . $property_uid . '.';
+        return [];
+    }
+
+    $chosen = hostfully_mphb_pick_property_description($items);
+    if (empty($chosen)) return [];
+
+    return [
+        'name' => (string)($chosen['name'] ?? ''),
+        'shortSummary' => (string)($chosen['shortSummary'] ?? ''),
+        'summary' => (string)($chosen['summary'] ?? ''),
+        'notes' => (string)($chosen['notes'] ?? ''),
+        'access' => (string)($chosen['access'] ?? ''),
+        'transit' => (string)($chosen['transit'] ?? ''),
+        'interaction' => (string)($chosen['interaction'] ?? ''),
+        'neighbourhood' => (string)($chosen['neighbourhood'] ?? ''),
+        'space' => (string)($chosen['space'] ?? ''),
+        'houseManual' => (string)($chosen['houseManual'] ?? ''),
+        'locale' => (string)($chosen['locale'] ?? ''),
+    ];
+}
+
+function hostfully_mphb_update_text_meta(int $post_id, string $key, $value): void
+{
+    $val = is_string($value) ? trim($value) : '';
+    if ($val === '') {
+        delete_post_meta($post_id, $key);
+        return;
+    }
+
+    update_post_meta($post_id, $key, wp_kses_post($val));
+}
+
+function hostfully_mphb_update_number_meta(int $post_id, string $key, $value): void
+{
+    if ($value === null || $value === '') {
+        delete_post_meta($post_id, $key);
+        return;
+    }
+
+    if (!is_numeric($value)) {
+        delete_post_meta($post_id, $key);
+        return;
+    }
+
+    update_post_meta($post_id, $key, (string)$value);
+}
+
+function hostfully_mphb_build_full_address(array $addr): string
+{
+    $parts = [];
+    foreach (['address', 'address2', 'city', 'state', 'zipCode', 'countryCode'] as $key) {
+        if (!empty($addr[$key]) && is_string($addr[$key])) {
+            $parts[] = trim($addr[$key]);
+        }
+    }
+
+    $parts = array_values(array_filter($parts));
+    return implode(', ', $parts);
+}
+
+function hostfully_mphb_extract_guest_counts(array $property): array
+{
+    $availability = $property['availability'] ?? [];
+    if (!is_array($availability)) $availability = [];
+
+    $max_guests = hostfully_mphb_extract_number($availability['maxGuests'] ?? null);
+    if ($max_guests === null) $max_guests = hostfully_mphb_extract_number($property['maxGuests'] ?? null);
+
+    $base_guests = hostfully_mphb_extract_number($availability['baseGuests'] ?? null);
+    if ($base_guests === null) $base_guests = hostfully_mphb_extract_number($property['baseGuests'] ?? null);
+
+    $beds = hostfully_mphb_extract_number($property['beds'] ?? null);
+    if ($beds === null && isset($property['beds'])) {
+        $beds = hostfully_mphb_sum_numeric_array($property['beds']);
+    }
+
+    if ($max_guests === null && $base_guests === null) {
+        if ($beds !== null && $beds > 0) {
+            $max_guests = $beds;
+        }
+    }
+
+    return [
+        'max' => $max_guests,
+        'base' => $base_guests,
+        'beds' => $beds,
+    ];
+}
 
 function hostfully_mphb_get_imported_uids(): array
 {
@@ -498,6 +659,12 @@ function hostfully_mphb_find_existing_room_id(string $property_uid): int
     ]);
 
     return !empty($existing) ? (int)$existing[0] : 0;
+}
+
+function hostfully_mphb_should_update_slugs(): bool
+{
+    $progress = get_option(HOSTFULLY_MPHB_OPT_PROGRESS, []);
+    return is_array($progress) && !empty($progress['update_slugs']);
 }
 
 function hostfully_mphb_ensure_all_year_season_meta(int $season_id, array &$log): void
@@ -653,20 +820,24 @@ function hostfully_mphb_upsert_rate_season_price(int $rate_id, int $season_id, f
     $log[] = 'Season price set for season ID ' . $season_id . ' (base price ' . $daily_rate . ').';
 }
 
-function hostfully_mphb_upsert_rate(int $room_type_id, array $property, float $daily_rate, int $adults, int $children, array &$log): int
+function hostfully_mphb_upsert_rate(int $room_type_id, array $property, float $daily_rate, int $adults, int $children, array &$log, string $title_base = ''): int
 {
     $property_uid = (string)($property['uid'] ?? '');
     if (!$property_uid) return 0;
 
     $existing_rate_id = hostfully_mphb_find_existing_rate_id($property_uid);
 
-    $rate_title = 'Standard – ' . ($property['name'] ?? 'Imported Property');
+    $name = $title_base !== '' ? $title_base : ($property['name'] ?? 'Imported Property');
+    $rate_title = 'Standard – ' . $name;
 
     $rate_args = [
         'post_type'   => 'mphb_rate',
         'post_status' => 'publish',
         'post_title'  => $rate_title,
     ];
+    if (hostfully_mphb_should_update_slugs()) {
+        $rate_args['post_name'] = sanitize_title($rate_title);
+    }
     if ($existing_rate_id) $rate_args['ID'] = $existing_rate_id;
 
     $rate_id = wp_insert_post($rate_args);
@@ -703,20 +874,24 @@ function hostfully_mphb_upsert_rate(int $room_type_id, array $property, float $d
     return $rate_id;
 }
 
-function hostfully_mphb_upsert_room_unit(int $room_type_id, array $property, array &$log): int
+function hostfully_mphb_upsert_room_unit(int $room_type_id, array $property, array &$log, string $title_base = ''): int
 {
     $property_uid = (string)($property['uid'] ?? '');
     if (!$property_uid) return 0;
 
     $existing_room_id = hostfully_mphb_find_existing_room_id($property_uid);
 
-    $room_title = 'Unit 1 – ' . ($property['name'] ?? 'Imported Property');
+    $name = $title_base !== '' ? $title_base : ($property['name'] ?? 'Imported Property');
+    $room_title = 'Unit 1 – ' . $name;
 
     $room_args = [
         'post_type'   => 'mphb_room',
         'post_status' => 'publish',
         'post_title'  => $room_title,
     ];
+    if (hostfully_mphb_should_update_slugs()) {
+        $room_args['post_name'] = sanitize_title($room_title);
+    }
     if ($existing_room_id) $room_args['ID'] = $existing_room_id;
 
     $room_id = wp_insert_post($room_args);
@@ -837,7 +1012,8 @@ function hostfully_mphb_set_amenity_map(array $map): void
 /**
  * Convert Hostfully amenity code like HAS_AIR_CONDITIONING to a human label.
  */
-function hostfully_mphb_prettify_amenity_code(string $code): string {
+function hostfully_mphb_prettify_amenity_code(string $code): string
+{
     $code = trim($code);
     if ($code === '') return '';
     $code = preg_replace('/^(HAS|IS|WITH)_/i', '', $code);
@@ -1041,111 +1217,110 @@ function hostfully_mphb_sync_amenities_catalog_from_properties(array &$log): arr
             $calls++;
 
             // Be kind to the API: throttle + cache
-if ($calls >= $limitCalls) break;
-$calls++;
+            if ($calls >= $limitCalls) break;
+            $calls++;
 
-$debugThis = ($calls <= 3); // log verbose details for first few calls
+            $debugThis = ($calls <= 3); // log verbose details for first few calls
 
-// 1) Try Available Amenities (documented as property-scoped)
-$url1 = rtrim($cfg['base_url'], '/') . '/available-amenities';
-$url1 = add_query_arg(['propertyUid' => $property_uid], $url1);
+            // 1) Try Available Amenities (documented as property-scoped)
+            $url1 = rtrim($cfg['base_url'], '/') . '/available-amenities';
+            $url1 = add_query_arg(['propertyUid' => $property_uid], $url1);
 
-$headers = [];
-$status  = 0;
-$raw     = '';
-$data = hostfully_mphb_api_get_json($url1, $headers, $status, $raw);
+            $headers = [];
+            $status  = 0;
+            $raw     = '';
+            $data = hostfully_mphb_api_get_json($url1, $headers, $status, $raw);
 
-if ($debugThis) {
-    $log[] = "Available amenities URL: {$url1} (HTTP {$status})";
-    if ($raw !== '') $log[] = 'Available amenities body: ' . mb_substr($raw, 0, 400);
-}
+            if ($debugThis) {
+                $log[] = "Available amenities URL: {$url1} (HTTP {$status})";
+                if ($raw !== '') $log[] = 'Available amenities body: ' . mb_substr($raw, 0, 400);
+            }
 
-if (is_wp_error($data)) {
-    $log[] = "Available amenities failed for property {$property_uid}: " . $data->get_error_message();
-    $items = [];
-} else {
-    // Support multiple shapes
-    $items = $data['amenities'] ?? $data['availableAmenities'] ?? $data['items'] ?? null;
-    if ($items === null && array_is_list($data)) $items = $data;
-    if (!is_array($items)) $items = [];
-}
+            if (is_wp_error($data)) {
+                $log[] = "Available amenities failed for property {$property_uid}: " . $data->get_error_message();
+                $items = [];
+            } else {
+                // Support multiple shapes
+                $items = $data['amenities'] ?? $data['availableAmenities'] ?? $data['items'] ?? null;
+                if ($items === null && array_is_list($data)) $items = $data;
+                if (!is_array($items)) $items = [];
+            }
 
-// 2) If empty, try /amenities filtered by propertyUid (some accounts/APIs require this)
-if (empty($items)) {
-    $url2 = rtrim($cfg['base_url'], '/') . '/amenities';
-    $url2 = add_query_arg(['propertyUid' => $property_uid, '_limit' => min(100, max(1, (int)($cfg['api_page_limit'] ?? 100)))], $url2);
+            // 2) If empty, try /amenities filtered by propertyUid (some accounts/APIs require this)
+            if (empty($items)) {
+                $url2 = rtrim($cfg['base_url'], '/') . '/amenities';
+                $url2 = add_query_arg(['propertyUid' => $property_uid, '_limit' => min(100, max(1, (int)($cfg['api_page_limit'] ?? 100)))], $url2);
 
-    $headers2 = [];
-    $status2  = 0;
-    $raw2     = '';
-    $data2 = hostfully_mphb_api_get_json($url2, $headers2, $status2, $raw2);
+                $headers2 = [];
+                $status2  = 0;
+                $raw2     = '';
+                $data2 = hostfully_mphb_api_get_json($url2, $headers2, $status2, $raw2);
 
-    if ($debugThis) {
-        $log[] = "Amenities (filtered) URL: {$url2} (HTTP {$status2})";
-        if ($raw2 !== '') $log[] = 'Amenities (filtered) body: ' . mb_substr($raw2, 0, 400);
-    }
+                if ($debugThis) {
+                    $log[] = "Amenities (filtered) URL: {$url2} (HTTP {$status2})";
+                    if ($raw2 !== '') $log[] = 'Amenities (filtered) body: ' . mb_substr($raw2, 0, 400);
+                }
 
-    if (!is_wp_error($data2)) {
-        $items2 = $data2['amenities'] ?? $data2['items'] ?? null;
-        if ($items2 === null && array_is_list($data2)) $items2 = $data2;
-        if (is_array($items2) && !empty($items2)) $items = $items2;
-    } elseif ($debugThis) {
-        $log[] = "Amenities (filtered) failed for property {$property_uid}: " . $data2->get_error_message();
-    }
-}
+                if (!is_wp_error($data2)) {
+                    $items2 = $data2['amenities'] ?? $data2['items'] ?? null;
+                    if ($items2 === null && array_is_list($data2)) $items2 = $data2;
+                    if (is_array($items2) && !empty($items2)) $items = $items2;
+                } elseif ($debugThis) {
+                    $log[] = "Amenities (filtered) failed for property {$property_uid}: " . $data2->get_error_message();
+                }
+            }
 
-// 3) If still empty, try Custom Amenities (if the account uses custom amenity objects)
-if (empty($items)) {
-    $url3 = rtrim($cfg['base_url'], '/') . '/custom-amenities';
-    // Docs say "given object UID and type"; common naming is objectUid/objectType.
-    $url3 = add_query_arg(['objectUid' => $property_uid, 'objectType' => 'PROPERTY'], $url3);
+            // 3) If still empty, try Custom Amenities (if the account uses custom amenity objects)
+            if (empty($items)) {
+                $url3 = rtrim($cfg['base_url'], '/') . '/custom-amenities';
+                // Docs say "given object UID and type"; common naming is objectUid/objectType.
+                $url3 = add_query_arg(['objectUid' => $property_uid, 'objectType' => 'PROPERTY'], $url3);
 
-    $headers3 = [];
-    $status3  = 0;
-    $raw3     = '';
-    $data3 = hostfully_mphb_api_get_json($url3, $headers3, $status3, $raw3);
+                $headers3 = [];
+                $status3  = 0;
+                $raw3     = '';
+                $data3 = hostfully_mphb_api_get_json($url3, $headers3, $status3, $raw3);
 
-    if ($debugThis) {
-        $log[] = "Custom amenities URL: {$url3} (HTTP {$status3})";
-        if ($raw3 !== '') $log[] = 'Custom amenities body: ' . mb_substr($raw3, 0, 400);
-    }
+                if ($debugThis) {
+                    $log[] = "Custom amenities URL: {$url3} (HTTP {$status3})";
+                    if ($raw3 !== '') $log[] = 'Custom amenities body: ' . mb_substr($raw3, 0, 400);
+                }
 
-    if (!is_wp_error($data3)) {
-        $items3 = $data3['customAmenities'] ?? $data3['amenities'] ?? $data3['items'] ?? null;
-        if ($items3 === null && array_is_list($data3)) $items3 = $data3;
-        if (is_array($items3) && !empty($items3)) $items = $items3;
-    } elseif ($debugThis) {
-        $log[] = "Custom amenities failed for property {$property_uid}: " . $data3->get_error_message();
-    }
-}
+                if (!is_wp_error($data3)) {
+                    $items3 = $data3['customAmenities'] ?? $data3['amenities'] ?? $data3['items'] ?? null;
+                    if ($items3 === null && array_is_list($data3)) $items3 = $data3;
+                    if (is_array($items3) && !empty($items3)) $items = $items3;
+                } elseif ($debugThis) {
+                    $log[] = "Custom amenities failed for property {$property_uid}: " . $data3->get_error_message();
+                }
+            }
 
-// Cache whatever we found (even if empty) to avoid repeating calls during testing.
-set_transient($cache_key, is_array($items) ? $items : [], HOUR_IN_SECONDS * max(1, $cache_hours));
+            // Cache whatever we found (even if empty) to avoid repeating calls during testing.
+            set_transient($cache_key, is_array($items) ? $items : [], HOUR_IN_SECONDS * max(1, $cache_hours));
 
-// small throttle to avoid hammering admin-ajax + API
-usleep(150000); // 150ms
+            // small throttle to avoid hammering admin-ajax + API
+            usleep(150000); // 150ms
         }
 
         if (!is_array($items) || empty($items)) continue;
 
-        
-foreach ($items as $a) {
-    // Hostfully returns different shapes depending on endpoint:
-    // - /amenities, /custom-amenities: { uid, name }
-    // - /available-amenities: { amenity: "HAS_TV", category: "...", channels: {...} }
-    $code = (string)($a['amenity'] ?? $a['code'] ?? '');
-    $uid  = (string)($a['uid'] ?? ($code !== '' ? $code : ''));
-    $name = (string)($a['name'] ?? $a['label'] ?? '');
 
-    if ($name === '' && $code !== '') {
-        $name = hostfully_mphb_prettify_amenity_code($code);
-    }
-    if ($name === '') continue;
+        foreach ($items as $a) {
+            // Hostfully returns different shapes depending on endpoint:
+            // - /amenities, /custom-amenities: { uid, name }
+            // - /available-amenities: { amenity: "HAS_TV", category: "...", channels: {...} }
+            $code = (string)($a['amenity'] ?? $a['code'] ?? '');
+            $uid  = (string)($a['uid'] ?? ($code !== '' ? $code : ''));
+            $name = (string)($a['name'] ?? $a['label'] ?? '');
 
-    $key = ($uid !== '' ? $uid : strtolower($name));
-    $unique[$key] = ['uid' => $uid, 'name' => $name];
-}
+            if ($name === '' && $code !== '') {
+                $name = hostfully_mphb_prettify_amenity_code($code);
+            }
+            if ($name === '') continue;
 
+            $key = ($uid !== '' ? $uid : strtolower($name));
+            $unique[$key] = ['uid' => $uid, 'name' => $name];
+        }
     }
 
     if (empty($unique)) {
@@ -1227,7 +1402,7 @@ function hostfully_mphb_fetch_amenities_for_property(array $property, array &$lo
             // Dedupe by uid/name combo
             $dedup = [];
             foreach ($items as $it) {
-                $key = ($it['uid'] ?: 'n:'.strtolower($it['name']));
+                $key = ($it['uid'] ?: 'n:' . strtolower($it['name']));
                 $dedup[$key] = $it;
             }
             return array_values($dedup);
@@ -1397,7 +1572,7 @@ function hostfully_mphb_fetch_amenities_for_property(array $property, array &$lo
     }    // Dedupe + cache
     $dedup = [];
     foreach ($items as $it) {
-        $key = ($it['uid'] ?: 'n:'.strtolower($it['name']));
+        $key = ($it['uid'] ?: 'n:' . strtolower($it['name']));
         $dedup[$key] = $it;
     }
     $items = array_values($dedup);
@@ -1476,16 +1651,24 @@ function hostfully_mphb_import_categories_tags(int $room_type_id, array $propert
     $category_terms = [];
     $tag_terms      = [];
 
-    // Best-effort mapping from Hostfully property payload
-    if (!empty($property['propertyType'])) $category_terms[] = (string)$property['propertyType'];
-    if (!empty($property['roomType']))     $tag_terms[]      = (string)$property['roomType'];
-    if (!empty($property['listingType']))  $tag_terms[]      = (string)$property['listingType'];
+    $extract_terms = function ($raw): array {
+        $out = [];
+        if (is_string($raw) && $raw !== '') $out[] = $raw;
+        if (is_array($raw)) {
+            foreach ($raw as $item) {
+                if (is_string($item) && $item !== '') {
+                    $out[] = $item;
+                } elseif (is_array($item) && !empty($item['name'])) {
+                    $out[] = (string)$item['name'];
+                }
+            }
+        }
+        return $out;
+    };
 
-    $addr = $property['address'] ?? [];
-    if (is_array($addr)) {
-        if (!empty($addr['city']))  $tag_terms[] = (string)$addr['city'];
-        if (!empty($addr['state'])) $tag_terms[] = (string)$addr['state'];
-    }
+    // Only map explicit categories/tags if Hostfully provides them.
+    $category_terms = $extract_terms($property['categories'] ?? []);
+    $tag_terms      = $extract_terms($property['tags'] ?? []);
 
     $category_terms = array_values(array_unique(array_filter(array_map('trim', $category_terms))));
     $tag_terms      = array_values(array_unique(array_filter(array_map('trim', $tag_terms))));
@@ -1576,7 +1759,7 @@ function hostfully_mphb_get_attribute_taxonomy_template_args(): array
 
     return [
         'public'            => false,
-        'publicly_queryable'=> false,
+        'publicly_queryable' => false,
         'show_ui'           => true,
         'show_admin_column' => false,
         'show_in_nav_menus' => false,
@@ -1868,6 +2051,23 @@ function hostfully_mphb_get_property_attribute_values(array $property): array
         $vals['size'] = ['value' => $size_ft2, 'unit' => 'sqft'];
     }
 
+    $location_parts = [];
+    $addr = $property['address'] ?? [];
+    if (is_array($addr)) {
+        if (!empty($addr['city'])) $location_parts[] = (string)$addr['city'];
+        if (!empty($addr['state'])) $location_parts[] = (string)$addr['state'];
+    }
+    if (!empty($location_parts)) {
+        $vals['location'] = implode(', ', $location_parts);
+    }
+
+    $ptype = $property['propertyType'] ?? '';
+    if (!$ptype && !empty($property['roomType'])) $ptype = (string)$property['roomType'];
+    if (!$ptype && !empty($property['listingType'])) $ptype = (string)$property['listingType'];
+    if (is_string($ptype) && trim($ptype) !== '') {
+        $vals['property_type'] = trim($ptype);
+    }
+
     return $vals;
 }
 
@@ -1884,6 +2084,10 @@ function hostfully_mphb_attribute_definition_for_key(string $key): array
             return ['slug' => 'mphb_ra_guest', 'label' => 'Guests'];
         case 'size':
             return ['slug' => 'mphb_ra_size', 'label' => 'Size'];
+        case 'location':
+            return ['slug' => 'mphb_ra_location', 'label' => 'Location'];
+        case 'property_type':
+            return ['slug' => 'mphb_ra_property_type', 'label' => 'Property Type'];
         default:
             return [];
     }
@@ -1909,6 +2113,8 @@ function hostfully_mphb_attribute_key_for_taxonomy(string $tax_slug, $tax_obj): 
     if (preg_match('/\bbeds?\b/', $hay) && strpos($hay, 'bedroom') === false) return 'beds';
     if (preg_match('/\bguests?\b|\boccupancy\b|\bpersons?\b|\bsleeps?\b/', $hay)) return 'guests';
     if (preg_match('/\bsize\b|\barea\b|\bsqm\b|\bsq m\b|\bm2\b|\bsqft\b|\bsq ft\b|\bsquare (meters?|feet)\b/', $hay)) return 'size';
+    if (preg_match('/\blocation\b|\barea\b|\bcity\b|\bregion\b|\bstate\b/', $hay)) return 'location';
+    if (preg_match('/\bproperty type\b|\btype\b|\bunit type\b|\blisting type\b/', $hay)) return 'property_type';
 
     return '';
 }
@@ -1971,6 +2177,10 @@ function hostfully_mphb_format_attribute_term(string $key, $value): string
 {
     if ($value === null || $value === '') return '';
 
+    if (in_array($key, ['location', 'property_type'], true)) {
+        return trim((string)$value);
+    }
+
     if ($key === 'size') {
         if (is_array($value) && isset($value['value'])) {
             $v = hostfully_mphb_extract_number($value['value']);
@@ -2007,6 +2217,10 @@ function hostfully_mphb_import_attributes(int $room_type_id, array $property, ar
     if (!empty($vals)) {
         // Drop zero/empty numeric values (e.g., Beds: 0) to avoid junk terms.
         foreach ($vals as $k => $v) {
+            if (in_array($k, ['location', 'property_type'], true)) {
+                if (!is_string($v) || trim($v) === '') unset($vals[$k]);
+                continue;
+            }
             if ($k === 'size' && is_array($v)) {
                 $sv = hostfully_mphb_extract_number($v['value'] ?? null);
                 if ($sv === null || $sv <= 0) unset($vals[$k]);
@@ -2224,15 +2438,25 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
         return 0;
     }
 
+    $desc = hostfully_mphb_fetch_property_descriptions($property_uid, $log);
+
     // 2) Create or update room type
+    $title = '';
+    if (!empty($desc['name'])) $title = $desc['name'];
+    if ($title === '' && !empty($property['name'])) $title = $property['name'];
+    if ($title === '') $title = 'Imported Property';
+
     $post_args = [
         'post_type'   => 'mphb_room_type',
         'post_status' => 'publish',
-        'post_title'  => $property['name'] ?? 'Imported Property',
+        'post_title'  => $title,
         'post_content' => !empty($property['webLink'])
             ? 'Imported from Hostfully. Source: ' . esc_url_raw($property['webLink'])
             : '',
     ];
+    if (hostfully_mphb_should_update_slugs()) {
+        $post_args['post_name'] = sanitize_title($title);
+    }
     if ($existing_post_id) $post_args['ID'] = $existing_post_id;
 
     $post_id = wp_insert_post($post_args);
@@ -2247,10 +2471,14 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     update_post_meta($post_id, '_hostfully_property_uid', $property['uid']);
 
     // 3) Core meta
-    $max_guests  = $property['availability']['maxGuests'] ?? null;
-    $base_guests = $property['availability']['baseGuests'] ?? null;
-    $adults      = (int)($max_guests ?? $base_guests ?? 2);
-    $children    = 0;
+    $guests = hostfully_mphb_extract_guest_counts($property);
+    $max_guests  = $guests['max'];
+    $base_guests = $guests['base'];
+    $beds        = $guests['beds'];
+
+    $adults   = (int)($max_guests ?? $base_guests ?? 2);
+    if ($adults < 1) $adults = 1;
+    $children = 0;
 
     $daily_rate  = $property['pricing']['dailyRate'] ?? 0;
 
@@ -2258,17 +2486,25 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     update_post_meta($post_id, 'mphb_children', $children);
     update_post_meta($post_id, 'mphb_price', (string)(int)round((float)$daily_rate));
 
+    hostfully_mphb_update_number_meta($post_id, '_hostfully_max_guests', $max_guests);
+    hostfully_mphb_update_number_meta($post_id, '_hostfully_base_guests', $base_guests);
+    hostfully_mphb_update_number_meta($post_id, '_hostfully_beds', $beds);
+
     $min_stay = $property['availability']['minimumStay'] ?? null;
     $max_stay = $property['availability']['maximumStay'] ?? null;
 
     if ($min_stay !== null) update_post_meta($post_id, 'mphb_min_stay', (int)$min_stay);
     if ($max_stay !== null) update_post_meta($post_id, 'mphb_max_stay', (int)$max_stay);
 
+    $log[] = 'Guests: max ' . ($max_guests ?? 'n/a') . ' | base ' . ($base_guests ?? 'n/a') . ' | beds ' . ($beds ?? 'n/a');
+    $log[] = 'Capacity rule: adults=' . $adults . ', children=' . $children . ' (Hostfully has no adult/child split).';
     $log[] = 'Adults: ' . $adults . ' | Price: ' . $daily_rate . ' | Min: ' . ($min_stay ?? '') . ' | Max: ' . ($max_stay ?? '');
 
     // 4) Description (best-effort)
     $description = '';
-    if (!empty($property['description'])) $description = $property['description'];
+    if (!empty($desc['summary'])) $description = $desc['summary'];
+    elseif (!empty($desc['shortSummary'])) $description = $desc['shortSummary'];
+    elseif (!empty($property['description'])) $description = $property['description'];
     elseif (!empty($property['publicDescription'])) $description = $property['publicDescription'];
     elseif (!empty($property['summary'])) $description = $property['summary'];
 
@@ -2291,6 +2527,29 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
             'ID'           => $post_id,
             'post_content' => wp_kses_post($description),
         ]);
+    }
+
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_summary', $desc['summary'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_short_summary', $desc['shortSummary'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_access', $desc['access'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_transit', $desc['transit'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_interaction', $desc['interaction'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_neighbourhood', $desc['neighbourhood'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_space', $desc['space'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_house_manual', $desc['houseManual'] ?? '');
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_notes', $desc['notes'] ?? '');
+
+    $addr = $property['address'] ?? [];
+    if (is_array($addr)) {
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_address_line1', $addr['address'] ?? '');
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_address_line2', $addr['address2'] ?? '');
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_city', $addr['city'] ?? '');
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_state', $addr['state'] ?? '');
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_postcode', $addr['zipCode'] ?? '');
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_country_code', $addr['countryCode'] ?? '');
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_full_address', hostfully_mphb_build_full_address($addr));
+        hostfully_mphb_update_number_meta($post_id, '_hostfully_lat', $addr['latitude'] ?? null);
+        hostfully_mphb_update_number_meta($post_id, '_hostfully_lng', $addr['longitude'] ?? null);
     }
 
     // 5) Amenities
@@ -2421,14 +2680,14 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     }
 
     // 9) Rate + at least one unit (bookable)
-    $rate_id = hostfully_mphb_upsert_rate((int)$post_id, $property, (float)$daily_rate, (int)$adults, (int)$children, $log);
+    $rate_id = hostfully_mphb_upsert_rate((int)$post_id, $property, (float)$daily_rate, (int)$adults, (int)$children, $log, $title);
     if ($rate_id) {
         $log[] = 'Rate linked OK: ' . $rate_id;
     } else {
         $log[] = 'Rate not created (check logs).';
     }
 
-    $room_id = hostfully_mphb_upsert_room_unit((int)$post_id, $property, $log);
+    $room_id = hostfully_mphb_upsert_room_unit((int)$post_id, $property, $log, $title);
     if ($room_id) {
         $log[] = 'Accommodation unit linked OK: ' . $room_id;
     } else {
@@ -2437,6 +2696,328 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
 
     hostfully_mphb_log_debug($log, 'Import debug: completed at ' . date('c'));
     return (int)$post_id;
+}
+
+function hostfully_mphb_cleanup_unused_terms(array &$log): array
+{
+    $taxes = [
+        'mphb_room_type_category',
+        'mphb_room_type_tag',
+        'mphb_room_type_facility',
+    ];
+
+    $attr_taxes = hostfully_mphb_get_attribute_taxonomies();
+    if (!empty($attr_taxes)) {
+        foreach ($attr_taxes as $slug => $_obj) {
+            $taxes[] = $slug;
+        }
+    }
+
+    $taxes = array_values(array_unique(array_filter($taxes, 'taxonomy_exists')));
+    $total_deleted = 0;
+
+    foreach ($taxes as $taxonomy) {
+        $terms = get_terms([
+            'taxonomy' => $taxonomy,
+            'hide_empty' => false,
+        ]);
+
+        if (is_wp_error($terms)) {
+            $log[] = 'Cleanup failed to read terms for ' . $taxonomy . ': ' . $terms->get_error_message();
+            continue;
+        }
+
+        $deleted = 0;
+        $scanned = 0;
+
+        foreach ($terms as $term) {
+            $scanned++;
+            if (!empty($term->count)) continue;
+            $res = wp_delete_term((int)$term->term_id, $taxonomy);
+            if (is_wp_error($res)) {
+                $log[] = 'Cleanup failed to delete term ' . $term->term_id . ' (' . $taxonomy . '): ' . $res->get_error_message();
+                continue;
+            }
+            $deleted++;
+            $total_deleted++;
+        }
+
+        $log[] = 'Cleanup ' . $taxonomy . ': scanned ' . $scanned . ', deleted ' . $deleted . '.';
+    }
+
+    $map = hostfully_mphb_get_amenity_map();
+    if (is_array($map) && !empty($map)) {
+        $before = count($map);
+        foreach ($map as $uid => $term_id) {
+            $term = get_term((int)$term_id, 'mphb_room_type_facility');
+            if (!$term || is_wp_error($term)) unset($map[$uid]);
+        }
+        if ($before !== count($map)) {
+            hostfully_mphb_set_amenity_map($map);
+            $log[] = 'Amenity map cleaned: ' . $before . ' → ' . count($map) . '.';
+        }
+    }
+
+    return [
+        'taxonomies' => count($taxes),
+        'total_deleted' => $total_deleted,
+    ];
+}
+
+function hostfully_mphb_clear_categories_tags_from_imports(array &$log): array
+{
+    $tax_category = 'mphb_room_type_category';
+    $tax_tag = 'mphb_room_type_tag';
+
+    $has_category = taxonomy_exists($tax_category);
+    $has_tag = taxonomy_exists($tax_tag);
+
+    if (!$has_category && !$has_tag) {
+        $log[] = 'Category/tag taxonomies not found. Skipping clear.';
+        return ['posts' => 0, 'categories_cleared' => 0, 'tags_cleared' => 0];
+    }
+
+    $posts = get_posts([
+        'post_type'      => 'mphb_room_type',
+        'posts_per_page' => -1,
+        'meta_key'       => '_hostfully_property_uid',
+        'fields'         => 'ids',
+    ]);
+
+    if (empty($posts)) {
+        $log[] = 'No imported accommodations found to clear categories/tags.';
+        return ['posts' => 0, 'categories_cleared' => 0, 'tags_cleared' => 0];
+    }
+
+    $posts_cleared = 0;
+    $cat_cleared = 0;
+    $tag_cleared = 0;
+
+    foreach ($posts as $post_id) {
+        $cleared_any = false;
+
+        if ($has_category) {
+            $cat_terms = wp_get_object_terms((int)$post_id, $tax_category, ['fields' => 'ids']);
+            if (!is_wp_error($cat_terms) && !empty($cat_terms)) {
+                $cat_cleared += count($cat_terms);
+                wp_set_object_terms((int)$post_id, [], $tax_category, false);
+                $cleared_any = true;
+            }
+        }
+
+        if ($has_tag) {
+            $tag_terms = wp_get_object_terms((int)$post_id, $tax_tag, ['fields' => 'ids']);
+            if (!is_wp_error($tag_terms) && !empty($tag_terms)) {
+                $tag_cleared += count($tag_terms);
+                wp_set_object_terms((int)$post_id, [], $tax_tag, false);
+                $cleared_any = true;
+            }
+        }
+
+        if ($cleared_any) $posts_cleared++;
+    }
+
+    $log[] = 'Cleared categories/tags from ' . $posts_cleared . ' accommodations (categories removed: ' . $cat_cleared . ', tags removed: ' . $tag_cleared . ').';
+
+    return [
+        'posts' => $posts_cleared,
+        'categories_cleared' => $cat_cleared,
+        'tags_cleared' => $tag_cleared,
+    ];
+}
+
+function hostfully_mphb_get_imported_uid_map(): array
+{
+    $posts = get_posts([
+        'post_type'      => 'mphb_room_type',
+        'posts_per_page' => -1,
+        'meta_key'       => '_hostfully_property_uid',
+        'fields'         => 'ids',
+    ]);
+
+    $map = [];
+    foreach ($posts as $post_id) {
+        $uid = get_post_meta($post_id, '_hostfully_property_uid', true);
+        if ($uid) $map[(string)$uid] = (int)$post_id;
+    }
+
+    return $map;
+}
+
+function hostfully_mphb_cleanup_orphan_rates(array $uid_map, array &$log): int
+{
+    $posts = get_posts([
+        'post_type'      => 'mphb_rate',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'meta_key'       => '_hostfully_property_uid',
+        'fields'         => 'ids',
+    ]);
+
+    $deleted = 0;
+    foreach ($posts as $post_id) {
+        $uid = get_post_meta($post_id, '_hostfully_property_uid', true);
+        if ($uid && !isset($uid_map[(string)$uid])) {
+            wp_delete_post((int)$post_id, true);
+            $deleted++;
+        }
+    }
+
+    $log[] = 'Cleanup orphan rates: deleted ' . $deleted . '.';
+    return $deleted;
+}
+
+function hostfully_mphb_cleanup_orphan_rooms(array $uid_map, array &$log): int
+{
+    $posts = get_posts([
+        'post_type'      => 'mphb_room',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'meta_key'       => '_hostfully_property_uid',
+        'fields'         => 'ids',
+    ]);
+
+    $deleted = 0;
+    foreach ($posts as $post_id) {
+        $uid = get_post_meta($post_id, '_hostfully_property_uid', true);
+        if ($uid && !isset($uid_map[(string)$uid])) {
+            wp_delete_post((int)$post_id, true);
+            $deleted++;
+        }
+    }
+
+    $log[] = 'Cleanup orphan rooms: deleted ' . $deleted . '.';
+    return $deleted;
+}
+
+function hostfully_mphb_cleanup_orphan_services(array &$log): int
+{
+    $room_types = get_posts([
+        'post_type'      => 'mphb_room_type',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'fields'         => 'ids',
+    ]);
+
+    $used = [];
+    foreach ($room_types as $post_id) {
+        $raw = get_post_meta($post_id, 'mphb_services', true);
+        $services = is_array($raw) ? $raw : maybe_unserialize($raw);
+        if (!is_array($services)) continue;
+        foreach ($services as $sid) {
+            $sid = (int)$sid;
+            if ($sid) $used[$sid] = true;
+        }
+    }
+
+    $services = get_posts([
+        'post_type'      => 'mphb_room_service',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'fields'         => 'ids',
+    ]);
+
+    $deleted = 0;
+    foreach ($services as $service_id) {
+        if (!isset($used[(int)$service_id])) {
+            wp_delete_post((int)$service_id, true);
+            $deleted++;
+        }
+    }
+
+    $log[] = 'Cleanup orphan services: deleted ' . $deleted . '.';
+    return $deleted;
+}
+
+function hostfully_mphb_cleanup_orphan_media(array &$log): int
+{
+    $attachments = get_posts([
+        'post_type'      => 'attachment',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'meta_query'     => [
+            [
+                'key'     => '_wp_attached_file',
+                'value'   => 'hostfully-',
+                'compare' => 'LIKE',
+            ],
+        ],
+        'fields' => 'ids',
+    ]);
+
+    $deleted = 0;
+    foreach ($attachments as $attach_id) {
+        $parent_id = (int)get_post_field('post_parent', $attach_id);
+        if ($parent_id === 0) continue;
+        $parent = get_post($parent_id);
+        if (!$parent || $parent->post_type !== 'mphb_room_type') {
+            wp_delete_attachment((int)$attach_id, true);
+            $deleted++;
+        }
+    }
+
+    $log[] = 'Cleanup orphan media: deleted ' . $deleted . '.';
+    return $deleted;
+}
+
+function hostfully_mphb_cleanup_attribute_registry(array &$log): int
+{
+    $reg = hostfully_mphb_get_attribute_registry();
+    if (empty($reg)) {
+        $log[] = 'Cleanup attribute registry: no entries.';
+        return 0;
+    }
+
+    $deleted = 0;
+    foreach ($reg as $slug => $_def) {
+        if (!taxonomy_exists($slug)) {
+            unset($reg[$slug]);
+            $deleted++;
+            continue;
+        }
+
+        $terms = get_terms([
+            'taxonomy' => $slug,
+            'hide_empty' => false,
+            'fields' => 'ids',
+            'number' => 1,
+        ]);
+
+        if (is_wp_error($terms) || empty($terms)) {
+            unset($reg[$slug]);
+            $deleted++;
+        }
+    }
+
+    hostfully_mphb_set_attribute_registry($reg);
+    $log[] = 'Cleanup attribute registry: removed ' . $deleted . ' entries.';
+    return $deleted;
+}
+
+function hostfully_mphb_unpublish_missing_properties(array &$log): int
+{
+    $hostfully = hostfully_mphb_get_properties_with_log($log);
+    $seen = [];
+    foreach ($hostfully as $p) {
+        $uid = (string)($p['uid'] ?? '');
+        if ($uid !== '') $seen[$uid] = true;
+    }
+
+    $uid_map = hostfully_mphb_get_imported_uid_map();
+    $missing = 0;
+
+    foreach ($uid_map as $uid => $post_id) {
+        if (!isset($seen[$uid])) {
+            wp_update_post([
+                'ID' => (int)$post_id,
+                'post_status' => 'draft',
+            ]);
+            $missing++;
+        }
+    }
+
+    $log[] = 'Unpublish missing properties: updated ' . $missing . ' to draft.';
+    return $missing;
 }
 
 /**
@@ -2478,11 +3059,34 @@ function hostfully_mphb_render_admin()
 
     // Manual sync is handled via AJAX (Catalog Sync section below).
 
-    $properties    = hostfully_mphb_get_properties();
     $imported_uids = hostfully_mphb_get_imported_uids();
     $last_error    = hostfully_mphb_get_last_error();
+    $amenity_map   = hostfully_mphb_get_amenity_map();
+
+    $next_action_label = '';
+    $next_action_link = '';
+    $next_action_hint = '';
+    $next_action_step = '';
+
+    if (empty($cfg['api_key']) || empty($cfg['agency_uid'])) {
+        $next_action_label = 'Save API settings';
+        $next_action_link = '#hostfully-step-settings';
+    } elseif (empty($amenity_map) || !is_array($amenity_map)) {
+        $next_action_label = 'Sync amenities catalog';
+        $next_action_link = '#hostfully-step-sync';
+    } elseif (empty($imported_uids)) {
+        $next_action_label = 'Import one property';
+        $next_action_link = '#hostfully-step-one';
+    } else {
+        $next_action_label = 'Run bulk import';
+        $next_action_link = '#hostfully-step-bulk';
+        $next_action_hint = 'Use Migration & Cleanup if you want to update existing imports.';
+    }
+    if ($next_action_link !== '') {
+        $next_action_step = ltrim($next_action_link, '#');
+    }
 ?>
-    <div class="wrap">
+    <div class="wrap" data-next-action="<?= esc_attr($next_action_step); ?>">
         <h1>Hostfully → MotoPress Import</h1>
 
         <?php if (!empty($last_error)): ?>
@@ -2495,142 +3099,370 @@ function hostfully_mphb_render_admin()
             </div>
         <?php endif; ?>
 
-        <h2>Quick Start</h2>
+        <h2>Workflow</h2>
         <ol>
-            <li>Enter your Hostfully API credentials and save settings.</li>
-            <li>Sync the amenities catalog once (recommended).</li>
-            <li>Run a single import to confirm everything looks correct.</li>
-            <li>Run bulk import to bring in all remaining properties.</li>
+            <li><a href="#hostfully-step-settings">Save API settings</a>.</li>
+            <li><a href="#hostfully-step-sync">Sync amenities catalog</a> (recommended once).</li>
+            <li><a href="#hostfully-step-one">Import one property</a> to validate.</li>
+            <li><a href="#hostfully-step-bulk">Bulk import</a> the rest.</li>
+            <li><a href="#hostfully-step-migrate">Migration & cleanup</a> if needed.</li>
         </ol>
+        <?php if ($next_action_label && $next_action_link): ?>
+            <div class="notice notice-info" style="margin:12px 0;">
+                <p><strong>Next recommended action:</strong> <a href="<?= esc_url($next_action_link); ?>"><?= esc_html($next_action_label); ?></a>.</p>
+                <?php if ($next_action_hint): ?>
+                    <p class="description" style="margin:0;"><?= esc_html($next_action_hint); ?></p>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
         <p class="description">Tip: If you need to optimize large images, do it after import using an optimizer plugin or a separate batch job.</p>
 
         <hr>
 
-        <h2>Step 1: API Settings</h2>
-        <form method="post">
-            <?php wp_nonce_field('hostfully_mphb_settings'); ?>
-            <table class="form-table" role="presentation">
-                <tr>
-                    <th scope="row"><label for="hostfully_api_key">API Key</label></th>
-                    <td><input id="hostfully_api_key" type="text" name="hostfully[api_key]" value="<?= esc_attr($cfg['api_key']); ?>" style="width:420px;"></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="hostfully_agency_uid">Agency UID</label></th>
-                    <td><input id="hostfully_agency_uid" type="text" name="hostfully[agency_uid]" value="<?= esc_attr($cfg['agency_uid']); ?>" style="width:420px;"></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="hostfully_max_photos">Max photos per property</label></th>
-                    <td><input id="hostfully_max_photos" type="number" min="0" name="hostfully[max_photos]" value="<?= esc_attr($cfg['max_photos']); ?>" style="width:120px;"></td>
-                </tr>
-                <tr>
-                    <th scope="row"><label for="hostfully_bulk_limit">Bulk import limit</label></th>
-                    <td><input id="hostfully_bulk_limit" type="number" min="1" name="hostfully[bulk_limit]" value="<?= esc_attr($cfg['bulk_limit']); ?>" style="width:120px;"></td>
-                </tr>
-                <tr>
-                    <th scope="row">Include inactive properties</th>
-                    <td>
-                        <label>
-                            <input type="checkbox" name="hostfully[include_inactive_properties]" value="1" <?= !empty($cfg['include_inactive_properties']) ? 'checked' : ''; ?>>
-                            Include inactive/archived properties when fetching from Hostfully
-                        </label>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">API enrichment</th>
-                    <td>
-                        <label style="display:block; margin:4px 0 6px;">
-                            <input type="checkbox" name="hostfully[allow_enrich_api]" value="1" <?= !empty($cfg['allow_enrich_api']) ? 'checked' : ''; ?>>
-                            Allow extra Hostfully API calls to enrich missing data (cached). Disable this if you’re worried about rate limits.
-                        </label>
-                        <label style="display:block; margin:4px 0 0;">
-                            Amenities cache hours:
-                            <input type="number" min="1" max="168" name="hostfully[amenities_cache_hours]" value="<?= esc_attr($cfg['amenities_cache_hours'] ?? 24); ?>" style="width:120px;">
-                        </label>
-                        <label style="display:block; margin:8px 0 0;">
-                            <input type="checkbox" name="hostfully[verbose_log]" value="1" <?= !empty($cfg['verbose_log']) ? 'checked' : ''; ?>>
-                            Enable verbose logging (adds detailed steps to the import log).
-                        </label>
-                        <p class="description" style="margin-top:8px;">Amenities cache hours controls how long we reuse Hostfully data before refreshing.</p>
-                    </td>
-                </tr>
+        <details id="hostfully-step-settings" data-step="hostfully-step-settings">
+            <summary><strong>Step 1: API Settings</strong></summary>
+            <div style="margin-top:8px;">
+                <form method="post">
+                    <?php wp_nonce_field('hostfully_mphb_settings'); ?>
+                    <table class="form-table" role="presentation">
+                        <tr>
+                            <th scope="row"><label for="hostfully_api_key">API Key</label></th>
+                            <td><input id="hostfully_api_key" type="text" name="hostfully[api_key]" value="<?= esc_attr($cfg['api_key']); ?>" style="width:420px;"></td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><label for="hostfully_agency_uid">Agency UID</label></th>
+                            <td><input id="hostfully_agency_uid" type="text" name="hostfully[agency_uid]" value="<?= esc_attr($cfg['agency_uid']); ?>" style="width:420px;"></td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><label for="hostfully_max_photos">Max photos per property</label></th>
+                            <td><input id="hostfully_max_photos" type="number" min="0" name="hostfully[max_photos]" value="<?= esc_attr($cfg['max_photos']); ?>" style="width:120px;"></td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><label for="hostfully_bulk_limit">Bulk import limit</label></th>
+                            <td><input id="hostfully_bulk_limit" type="number" min="1" name="hostfully[bulk_limit]" value="<?= esc_attr($cfg['bulk_limit']); ?>" style="width:120px;"></td>
+                        </tr>
+                        <tr>
+                            <th scope="row">Include inactive properties</th>
+                            <td>
+                                <label>
+                                    <input type="checkbox" name="hostfully[include_inactive_properties]" value="1" <?= !empty($cfg['include_inactive_properties']) ? 'checked' : ''; ?>>
+                                    Include inactive/archived properties when fetching from Hostfully
+                                </label>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row">API enrichment</th>
+                            <td>
+                                <label style="display:block; margin:4px 0 6px;">
+                                    <input type="checkbox" name="hostfully[allow_enrich_api]" value="1" <?= !empty($cfg['allow_enrich_api']) ? 'checked' : ''; ?>>
+                                    Allow extra Hostfully API calls to enrich missing data (cached). Disable this if you’re worried about rate limits.
+                                </label>
+                                <label style="display:block; margin:4px 0 0;">
+                                    Amenities cache hours:
+                                    <input type="number" min="1" max="168" name="hostfully[amenities_cache_hours]" value="<?= esc_attr($cfg['amenities_cache_hours'] ?? 24); ?>" style="width:120px;">
+                                </label>
+                                <label style="display:block; margin:8px 0 0;">
+                                    <input type="checkbox" name="hostfully[verbose_log]" value="1" <?= !empty($cfg['verbose_log']) ? 'checked' : ''; ?>>
+                                    Enable verbose logging (adds detailed steps to the import log).
+                                </label>
+                                <p class="description" style="margin-top:8px;">Amenities cache hours controls how long we reuse Hostfully data before refreshing.</p>
+                            </td>
+                        </tr>
 
-            </table>
+                    </table>
 
-            <p>
-                <button class="button button-primary" name="hostfully_save_settings" value="1">Save Settings</button>
-            </p>
-        </form>
-
-        <hr>
-
-        <h2>Step 2: Catalog Sync (Recommended)</h2>
-        <p>Sync global lists (like amenities) once to reduce per-property API calls and keep mappings stable.</p>
-
-        <p>
-            <button id="hostfully-sync-amenities" class="button">Sync Amenities Catalog</button>
-        </p>
+                    <p>
+                        <button class="button button-primary" name="hostfully_save_settings" value="1">Save Settings</button>
+                    </p>
+                </form>
+            </div>
+        </details>
 
         <hr>
 
-        <h2>Step 3: Import One (Test)</h2>
-        <form method="post" id="hostfully-import-one-form">
-            <?php wp_nonce_field('hostfully_mphb_import_one'); ?>
+        <details id="hostfully-step-sync" data-step="hostfully-step-sync">
+            <summary><strong>Step 2: Catalog Sync (Recommended)</strong></summary>
+            <div style="margin-top:8px;">
+                <p>Sync global lists (like amenities) once to reduce per-property API calls and keep mappings stable.</p>
 
-            <p>
-                <label>Select Hostfully Property</label><br>
-                <label style="display:block; margin:6px 0 8px;">
-                    <input type="checkbox" name="update_existing" value="1"> Allow updating an already-imported property
+                <p>
+                    <button id="hostfully-sync-amenities" class="button">Sync Amenities Catalog</button>
+                </p>
+            </div>
+        </details>
+
+        <hr>
+
+        <details id="hostfully-step-one" data-step="hostfully-step-one">
+            <summary><strong>Step 3: Import One (Test)</strong></summary>
+            <div style="margin-top:8px;">
+                <form method="post" id="hostfully-import-one-form">
+                    <?php wp_nonce_field('hostfully_mphb_import_one'); ?>
+
+                    <p>
+                        <label>Select Hostfully Property</label><br>
+                        <label style="display:block; margin:6px 0 8px;">
+                            <input type="checkbox" name="update_existing" value="1"> Allow updating an already-imported property
+                        </label>
+                        <select name="property_uid" id="hostfully-property-select" style="width:420px;">
+                            <option value="">-- Load properties to select --</option>
+                        </select>
+                        <button id="hostfully-load-properties" class="button" style="margin-left:6px;">Load properties</button>
+                        <button id="hostfully-refresh-properties" class="button" style="margin-left:6px;">Refresh</button>
+                        <span id="hostfully-load-properties-status" style="margin-left:6px; color:#666;"></span>
+                        <span id="hostfully-load-properties-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                    </p>
+
+                    <p>
+                        <button class="button button-primary" name="hostfully_import_one" value="1">Import Selected</button>
+                        <span id="hostfully-import-one-status" style="margin-left:10px; color:#666;"></span>
+                        <span id="hostfully-import-one-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                    </p>
+                </form>
+            </div>
+        </details>
+
+        <hr>
+
+        <details id="hostfully-step-bulk" data-step="hostfully-step-bulk">
+            <summary><strong>Step 4: Bulk Import</strong></summary>
+            <div style="margin-top:8px;">
+                <p>This will import properties that are not yet imported (up to your bulk limit), one at a time via AJAX so the page doesn’t time out.</p>
+
+                <p>
+                    <label style="margin-right:12px;">
+                        <input type="checkbox" id="hostfully-bulk-update-existing" value="1"> Update existing imports too
+                    </label>
+                    <label style="margin-right:12px;">
+                        <input type="checkbox" id="hostfully-bulk-update-slugs" value="1"> Update slugs to match titles
+                    </label>
+                    <button id="hostfully-bulk-start" class="button button-primary">Start Bulk Import</button>
+                    <button id="hostfully-bulk-stop" class="button" disabled>Stop</button>
+                </p>
+
+                <div id="hostfully-progress" style="display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;">
+                    <strong>Status:</strong> <span id="hostfully-status">Idle</span>
+                    <span id="hostfully-spinner" class="spinner" style="float:none; margin-left:8px; vertical-align:middle;"></span>
+                    <span id="hostfully-counter" style="margin-left:8px; color:#555;"></span>
+                    <pre id="hostfully-log" style="white-space:pre-wrap; margin-top:10px;"></pre>
+                    <div id="hostfully-summary" style="display:none; margin-top:10px; padding:8px; background:#f6f7f7; border:1px solid #ccd0d4;"></div>
+                </div>
+                <p id="hostfully-js-indicator" style="margin-top:8px; color:#666; font-size:12px;">JS status: not loaded</p>
+            </div>
+        </details>
+
+        <hr>
+
+        <details id="hostfully-step-migrate" data-step="hostfully-step-migrate">
+            <summary><strong>Step 5: Migration & Cleanup</strong></summary>
+            <div style="margin-top:8px;">
+                <p>Runs through already-imported properties and updates them to apply the latest mapping rules (e.g., new attributes).</p>
+                <p>
+                    <button id="hostfully-migrate-start" class="button">Start Migration Pass</button>
+                    <button id="hostfully-cleanup-terms" class="button">Cleanup Unused Terms</button>
+                </p>
+                <label style="display:block; margin:-4px 0 10px;">
+                    <input type="checkbox" id="hostfully-migrate-update-slugs" value="1">
+                    Update slugs to match the new titles (accommodation type, rate, unit)
                 </label>
-                <select name="property_uid" style="width:420px;">
-                    <option value="">-- Select a property --</option>
-
-                    <?php foreach ($properties as $property): ?>
-                        <?php
-                        $uid  = $property['uid'] ?? '';
-                        $name = $property['name'] ?? 'Unnamed property';
-                        $is_imported = in_array($uid, $imported_uids, true);
-                        if (!$uid) continue;
-                        if ($is_imported && empty($_POST['update_existing'])) {
-                            // show but disabled unless update mode is enabled
-                        }
-                        ?>
-                        <option value="<?= esc_attr($uid); ?>" <?= $is_imported ? 'data-imported="1"' : ''; ?>><?= esc_html($name . ($is_imported ? ' (imported)' : '')); ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </p>
-
-            <p>
-                <button class="button button-primary" name="hostfully_import_one" value="1">Import Selected</button>
-                <span id="hostfully-import-one-status" style="margin-left:10px; color:#666;"></span>
-                <span id="hostfully-import-one-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
-            </p>
-        </form>
-
-        <hr>
-
-        <h2>Step 4: Bulk Import</h2>
-        <p>This will import properties that are not yet imported (up to your bulk limit), one at a time via AJAX so the page doesn’t time out.</p>
-
-        <p>
-            <label style="margin-right:12px;">
-                <input type="checkbox" id="hostfully-bulk-update-existing" value="1"> Update existing imports too
-            </label>
-            <button id="hostfully-bulk-start" class="button button-primary">Start Bulk Import</button>
-            <button id="hostfully-bulk-stop" class="button" disabled>Stop</button>
-        </p>
-
-        <div id="hostfully-progress" style="display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;">
-            <strong>Status:</strong> <span id="hostfully-status">Idle</span>
-            <span id="hostfully-spinner" class="spinner" style="float:none; margin-left:8px; vertical-align:middle;"></span>
-            <span id="hostfully-counter" style="margin-left:8px; color:#555;"></span>
-            <pre id="hostfully-log" style="white-space:pre-wrap; margin-top:10px;"></pre>
-            <div id="hostfully-summary" style="display:none; margin-top:10px; padding:8px; background:#f6f7f7; border:1px solid #ccd0d4;"></div>
-        </div>
-        <p id="hostfully-js-indicator" style="margin-top:8px; color:#666; font-size:12px;">JS status: not loaded</p>
+                <div style="margin:8px 0 0; padding:10px; background:#f6f7f7; border:1px solid #ccd0d4; max-width:900px;">
+                    <strong>Cleanup options</strong>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-cleanup-terms-opt" checked>
+                        Remove unused terms (amenities/tags/categories/attributes)
+                    </label>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-cleanup-orphan-rates" checked>
+                        Remove orphan rates (no matching imported property UID)
+                    </label>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-cleanup-orphan-rooms" checked>
+                        Remove orphan rooms (no matching imported property UID)
+                    </label>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-cleanup-orphan-services" checked>
+                        Remove unused services (not assigned to any room type)
+                    </label>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-cleanup-orphan-media" checked>
+                        Remove orphan media (hostfully images whose parent is missing)
+                    </label>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-cleanup-attr-reg" checked>
+                        Clean attribute registry (remove unused or missing taxonomies)
+                    </label>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-cleanup-clear-cats-tags">
+                        Clear categories/tags from imported accommodations
+                    </label>
+                    <label style="display:block; margin:6px 0 0;">
+                        <input type="checkbox" id="hostfully-unpublish-missing" checked>
+                        Unpublish imports missing from Hostfully (set to draft)
+                    </label>
+                    <p class="description" style="margin:8px 0 0;">Tip: Unpublish missing properties compares current Hostfully list vs imported items.</p>
+                </div>
+            </div>
+        </details>
 
         <hr>
 
-        <h2>Step 5: Import by UID List (When API Listing Is Incomplete)</h2>
+        <details id="hostfully-step-uid" data-step="hostfully-step-uid">
+            <summary><strong>Step 6: Import by UID List (When API Listing Is Incomplete)</strong></summary>
+            <div style="margin-top:8px;">
+                <p>If Hostfully’s property list doesn’t return everything, paste a list of property UIDs below (from a Hostfully export or UI copy). We’ll import only those UIDs.</p>
+                <form id="hostfully-uid-import-form">
+                    <?php wp_nonce_field('hostfully_mphb_import_uids'); ?>
+                    <p>
+                        <label for="hostfully_uid_list"><strong>Property UIDs (one per line or CSV)</strong></label><br>
+                        <textarea id="hostfully_uid_list" name="uids_raw" rows="5" style="width:620px; max-width:100%;"></textarea>
+                    </p>
+                    <p>
+                        <button class="button" id="hostfully-uid-compare">Compare & Show Missing</button>
+                        <span style="margin-left:6px; color:#666;">Compares pasted UIDs vs already-imported ones.</span>
+                    </p>
+                    <p>
+                        <label for="hostfully_uid_missing"><strong>Missing UIDs (not imported yet)</strong></label><br>
+                        <textarea id="hostfully_uid_missing" rows="5" style="width:620px; max-width:100%;" readonly></textarea>
+                    </p>
+                    <p>
+                        <button class="button" id="hostfully-uid-use-missing">Use Missing as Import List</button>
+                    </p>
+                    <p>
+                        <label>
+                            <input type="checkbox" id="hostfully-uid-update-existing" value="1"> Update existing imports too
+                        </label>
+                    </p>
+                    <p>
+                        <button class="button button-primary" id="hostfully-uid-start">Import UIDs</button>
+                    </p>
+                </form>
+            </div>
+        </details>
+
+        <hr>
+
+        <details id="hostfully-step-meta" data-step="hostfully-step-meta">
+            <summary><strong>Reference: Elementor Meta Helper</strong></summary>
+            <div style="margin-top:8px;">
+                <p>Use these custom field keys with Elementor Dynamic Tags → Post Custom Field.</p>
+                <table class="widefat fixed striped" style="max-width:900px;">
+                    <thead>
+                        <tr>
+                            <th style="width:260px;">Field</th>
+                            <th>Meta Key</th>
+                            <th style="width:120px;">Copy</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Summary</td>
+                            <td>_hostfully_desc_summary</td>
+                            <td><button class="button" data-copy="_hostfully_desc_summary" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Short summary</td>
+                            <td>_hostfully_desc_short_summary</td>
+                            <td><button class="button" data-copy="_hostfully_desc_short_summary" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Access</td>
+                            <td>_hostfully_desc_access</td>
+                            <td><button class="button" data-copy="_hostfully_desc_access" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Transit</td>
+                            <td>_hostfully_desc_transit</td>
+                            <td><button class="button" data-copy="_hostfully_desc_transit" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Interaction</td>
+                            <td>_hostfully_desc_interaction</td>
+                            <td><button class="button" data-copy="_hostfully_desc_interaction" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Neighbourhood</td>
+                            <td>_hostfully_desc_neighbourhood</td>
+                            <td><button class="button" data-copy="_hostfully_desc_neighbourhood" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Space</td>
+                            <td>_hostfully_desc_space</td>
+                            <td><button class="button" data-copy="_hostfully_desc_space" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>House manual</td>
+                            <td>_hostfully_desc_house_manual</td>
+                            <td><button class="button" data-copy="_hostfully_desc_house_manual" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Notes</td>
+                            <td>_hostfully_desc_notes</td>
+                            <td><button class="button" data-copy="_hostfully_desc_notes" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Full address</td>
+                            <td>_hostfully_full_address</td>
+                            <td><button class="button" data-copy="_hostfully_full_address" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Address line 1</td>
+                            <td>_hostfully_address_line1</td>
+                            <td><button class="button" data-copy="_hostfully_address_line1" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Address line 2</td>
+                            <td>_hostfully_address_line2</td>
+                            <td><button class="button" data-copy="_hostfully_address_line2" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>City</td>
+                            <td>_hostfully_city</td>
+                            <td><button class="button" data-copy="_hostfully_city" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>State/Region</td>
+                            <td>_hostfully_state</td>
+                            <td><button class="button" data-copy="_hostfully_state" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Postal code</td>
+                            <td>_hostfully_postcode</td>
+                            <td><button class="button" data-copy="_hostfully_postcode" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Country code</td>
+                            <td>_hostfully_country_code</td>
+                            <td><button class="button" data-copy="_hostfully_country_code" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Latitude</td>
+                            <td>_hostfully_lat</td>
+                            <td><button class="button" data-copy="_hostfully_lat" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Longitude</td>
+                            <td>_hostfully_lng</td>
+                            <td><button class="button" data-copy="_hostfully_lng" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Max guests</td>
+                            <td>_hostfully_max_guests</td>
+                            <td><button class="button" data-copy="_hostfully_max_guests" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Base guests</td>
+                            <td>_hostfully_base_guests</td>
+                            <td><button class="button" data-copy="_hostfully_base_guests" type="button">Copy</button></td>
+                        </tr>
+                        <tr>
+                            <td>Beds</td>
+                            <td>_hostfully_beds</td>
+                            <td><button class="button" data-copy="_hostfully_beds" type="button">Copy</button></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </details>
         <p>If Hostfully’s property list doesn’t return everything, paste a list of property UIDs below (from a Hostfully export or UI copy). We’ll import only those UIDs.</p>
         <form id="hostfully-uid-import-form">
             <?php wp_nonce_field('hostfully_mphb_import_uids'); ?>
@@ -2730,6 +3562,7 @@ add_action('wp_ajax_hostfully_mphb_bulk_start', function () {
 
     update_option(HOSTFULLY_MPHB_OPT_QUEUE, $missing, false);
 
+    $update_slugs = !empty($_POST['update_slugs']);
     $progress = [
         'total'      => count($missing),
         'done'       => 0,
@@ -2737,6 +3570,7 @@ add_action('wp_ajax_hostfully_mphb_bulk_start', function () {
         'errors'     => 0,
         'created'    => 0,
         'updated'    => 0,
+        'update_slugs' => $update_slugs,
         'started_at' => time(),
     ];
     update_option(HOSTFULLY_MPHB_OPT_PROGRESS, $progress, false);
@@ -2746,8 +3580,46 @@ add_action('wp_ajax_hostfully_mphb_bulk_start', function () {
         'queue' => $missing,
         'properties_total' => count($properties),
         'update_existing' => $update_existing,
+        'update_slugs' => $update_slugs,
         'last_error' => hostfully_mphb_get_last_error(),
         'log' => $start_log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_migrate_start', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $imported = hostfully_mphb_get_imported_uids();
+    $queue = array_values($imported);
+
+    update_option(HOSTFULLY_MPHB_OPT_QUEUE, $queue, false);
+
+    $update_slugs = !empty($_POST['update_slugs']);
+    $progress = [
+        'total'      => count($queue),
+        'done'       => 0,
+        'last'       => null,
+        'errors'     => 0,
+        'created'    => 0,
+        'updated'    => 0,
+        'update_slugs' => $update_slugs,
+        'started_at' => time(),
+    ];
+    update_option(HOSTFULLY_MPHB_OPT_PROGRESS, $progress, false);
+
+    $log = [];
+    $log[] = 'Migration queue prepared: ' . count($queue) . ' imported properties.';
+    if (empty($queue)) {
+        $log[] = 'Nothing to migrate.';
+    }
+
+    wp_send_json_success([
+        'total' => $progress['total'],
+        'queue' => $queue,
+        'last_error' => hostfully_mphb_get_last_error(),
+        'log' => $log,
+        'update_slugs' => $update_slugs,
     ]);
 });
 
@@ -2842,7 +3714,7 @@ add_action('wp_ajax_hostfully_mphb_bulk_tick', function () {
     try {
         $post_id = hostfully_mphb_import_property($uid, $log);
     } catch (Throwable $e) {
-        $msg = 'Import exception: ' . $e->getMessage() . ' ('. get_class($e) . ') in ' . $e->getFile() . ':' . $e->getLine();
+        $msg = 'Import exception: ' . $e->getMessage() . ' (' . get_class($e) . ') in ' . $e->getFile() . ':' . $e->getLine();
         $log[] = $msg;
         hostfully_mphb_set_last_error($msg);
         error_log('[Hostfully Importer] Exception during bulk tick: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
@@ -2899,7 +3771,7 @@ add_action('wp_ajax_hostfully_mphb_import_one', function () {
     try {
         $post_id = hostfully_mphb_import_property($property_uid, $log);
     } catch (Throwable $e) {
-        $msg = 'Import exception: ' . $e->getMessage() . ' ('. get_class($e) . ') in ' . $e->getFile() . ':' . $e->getLine();
+        $msg = 'Import exception: ' . $e->getMessage() . ' (' . get_class($e) . ') in ' . $e->getFile() . ':' . $e->getLine();
         $log[] = $msg;
         hostfully_mphb_set_last_error($msg);
         error_log('[Hostfully Importer] Exception during single import: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
@@ -2929,12 +3801,93 @@ add_action('wp_ajax_hostfully_mphb_import_one', function () {
     ]);
 });
 
+add_action('wp_ajax_hostfully_mphb_fetch_properties', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $log = [];
+    if (!empty($_POST['force_refresh'])) {
+        hostfully_mphb_clear_property_list_cache();
+        $log[] = 'Property list cache cleared.';
+    }
+    $properties = hostfully_mphb_get_property_list_cached($log);
+    $imported = hostfully_mphb_get_imported_uids();
+    $imported_map = array_fill_keys($imported, true);
+
+    $items = [];
+    foreach ($properties as $p) {
+        if (!is_array($p) || empty($p['uid'])) continue;
+        $uid = (string)$p['uid'];
+        $items[] = [
+            'uid' => $uid,
+            'name' => (string)($p['name'] ?? 'Unnamed property'),
+            'imported' => !empty($imported_map[$uid]),
+        ];
+    }
+
+    wp_send_json_success([
+        'properties' => $items,
+        'count' => count($items),
+        'log' => $log,
+    ]);
+});
+
 add_action('wp_ajax_hostfully_mphb_get_last_error', function () {
     if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
     check_ajax_referer('hostfully_mphb_ajax', 'nonce');
 
     wp_send_json_success([
         'last_error' => hostfully_mphb_get_last_error(),
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_cleanup_terms', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $opts = [
+        'cleanup_terms' => !empty($_POST['cleanup_terms']),
+        'cleanup_orphan_rates' => !empty($_POST['cleanup_orphan_rates']),
+        'cleanup_orphan_rooms' => !empty($_POST['cleanup_orphan_rooms']),
+        'cleanup_orphan_services' => !empty($_POST['cleanup_orphan_services']),
+        'cleanup_orphan_media' => !empty($_POST['cleanup_orphan_media']),
+        'cleanup_attr_reg' => !empty($_POST['cleanup_attr_reg']),
+        'cleanup_clear_cats_tags' => !empty($_POST['cleanup_clear_cats_tags']),
+        'unpublish_missing' => !empty($_POST['unpublish_missing']),
+    ];
+
+    $log = [];
+    $result = [];
+
+    $uid_map = hostfully_mphb_get_imported_uid_map();
+    if (!empty($opts['cleanup_terms'])) {
+        $result['terms'] = hostfully_mphb_cleanup_unused_terms($log);
+    }
+    if (!empty($opts['cleanup_orphan_rates'])) {
+        $result['orphan_rates'] = hostfully_mphb_cleanup_orphan_rates($uid_map, $log);
+    }
+    if (!empty($opts['cleanup_orphan_rooms'])) {
+        $result['orphan_rooms'] = hostfully_mphb_cleanup_orphan_rooms($uid_map, $log);
+    }
+    if (!empty($opts['cleanup_orphan_services'])) {
+        $result['orphan_services'] = hostfully_mphb_cleanup_orphan_services($log);
+    }
+    if (!empty($opts['cleanup_orphan_media'])) {
+        $result['orphan_media'] = hostfully_mphb_cleanup_orphan_media($log);
+    }
+    if (!empty($opts['cleanup_attr_reg'])) {
+        $result['attribute_registry'] = hostfully_mphb_cleanup_attribute_registry($log);
+    }
+    if (!empty($opts['cleanup_clear_cats_tags'])) {
+        $result['clear_cats_tags'] = hostfully_mphb_clear_categories_tags_from_imports($log);
+    }
+    if (!empty($opts['unpublish_missing'])) {
+        $result['unpublish_missing'] = hostfully_mphb_unpublish_missing_properties($log);
+    }
+
+    wp_send_json_success([
+        'result' => $result,
+        'log' => $log,
     ]);
 });
 
