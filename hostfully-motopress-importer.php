@@ -648,6 +648,89 @@ function hostfully_mphb_extract_guest_counts(array $property): array
     ];
 }
 
+function hostfully_mphb_trim_text(string $text, int $max_len): string
+{
+    $text = wp_strip_all_tags($text);
+    $text = trim(preg_replace('/\s+/', ' ', $text));
+    if ($text === '' || $max_len < 1) return '';
+
+    $len = function_exists('mb_strlen') ? mb_strlen($text) : strlen($text);
+    if ($len <= $max_len) return $text;
+
+    $cut = function_exists('mb_substr') ? mb_substr($text, 0, $max_len + 1) : substr($text, 0, $max_len + 1);
+    $cut = rtrim($cut);
+    $space = function_exists('mb_strrpos') ? mb_strrpos($cut, ' ') : strrpos($cut, ' ');
+    if ($space !== false) {
+        $cut = function_exists('mb_substr') ? mb_substr($cut, 0, $space) : substr($cut, 0, $space);
+    }
+    return rtrim($cut, " \t\n\r\0\x0B.,;:");
+}
+
+function hostfully_mphb_first_sentence(string $text): string
+{
+    $text = wp_strip_all_tags($text);
+    $text = trim(preg_replace('/\s+/', ' ', $text));
+    if ($text === '') return '';
+
+    $parts = preg_split('/(?<=[.!?])\s+/', $text, 2);
+    if (!empty($parts[0])) return trim($parts[0]);
+    return $text;
+}
+
+function hostfully_mphb_build_excerpt(string $title, array $property, array $desc): string
+{
+    $short = (string)($desc['shortSummary'] ?? '');
+    if (trim($short) !== '') return hostfully_mphb_trim_text($short, 240);
+
+    $summary = (string)($desc['summary'] ?? '');
+    if (trim($summary) !== '') return hostfully_mphb_trim_text($summary, 240);
+
+    $city = '';
+    if (!empty($property['address']['city'])) $city = (string)$property['address']['city'];
+
+    $guests = hostfully_mphb_extract_guest_counts($property);
+    $max_guests = $guests['max'] ?? null;
+
+    $parts = [];
+    if ($title !== '') {
+        $parts[] = $city !== '' ? $title . ' in ' . $city : $title;
+    }
+    if ($max_guests !== null) {
+        $parts[] = 'Sleeps ' . (int)$max_guests . '.';
+    }
+
+    $fallback = trim(implode(' ', $parts));
+    return hostfully_mphb_trim_text($fallback, 240);
+}
+
+function hostfully_mphb_build_yoast_metadesc(string $title, array $property, array $desc): string
+{
+    $city = '';
+    if (!empty($property['address']['city'])) $city = (string)$property['address']['city'];
+
+    $guests = hostfully_mphb_extract_guest_counts($property);
+    $max_guests = $guests['max'] ?? null;
+
+    $summary_source = '';
+    if (!empty($desc['summary'])) $summary_source = (string)$desc['summary'];
+    elseif (!empty($desc['shortSummary'])) $summary_source = (string)$desc['shortSummary'];
+
+    $sentence = hostfully_mphb_first_sentence($summary_source);
+    if ($sentence === '') $sentence = 'Comfortable stay with great amenities and location.';
+
+    $parts = [];
+    if ($title !== '') {
+        $parts[] = $city !== '' ? $title . ' in ' . $city : $title;
+    }
+    if ($max_guests !== null) {
+        $parts[] = 'Sleeps ' . (int)$max_guests . '.';
+    }
+    $parts[] = $sentence;
+
+    $meta = trim(implode(' ', $parts));
+    return hostfully_mphb_trim_text($meta, 160);
+}
+
 function hostfully_mphb_get_imported_uids(): array
 {
     $posts = get_posts([
@@ -2577,6 +2660,19 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
         ]);
     }
 
+    $excerpt = hostfully_mphb_build_excerpt($title, $property, $desc);
+    if ($excerpt !== '') {
+        wp_update_post([
+            'ID'           => $post_id,
+            'post_excerpt' => $excerpt,
+        ]);
+    }
+
+    $yoast_desc = hostfully_mphb_build_yoast_metadesc($title, $property, $desc);
+    if ($yoast_desc !== '') {
+        update_post_meta($post_id, '_yoast_wpseo_metadesc', $yoast_desc);
+    }
+
     hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_summary', $desc['summary'] ?? '');
     hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_short_summary', $desc['shortSummary'] ?? '');
     hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_access', $desc['access'] ?? '');
@@ -3397,11 +3493,34 @@ function hostfully_mphb_render_admin()
                     <label for="hostfully-ical-report-limit" style="margin-right:8px;">Max properties to scan</label>
                     <input id="hostfully-ical-report-limit" type="number" min="1" max="200" value="50" style="width:120px;">
                     <button id="hostfully-ical-report-run" class="button" style="margin-left:8px;">Run iCal Audit</button>
+                    <button id="hostfully-ical-report-csv" class="button" style="margin-left:6px;">Download Needs Setup CSV</button>
                     <span id="hostfully-ical-report-status" style="margin-left:8px; color:#666;"></span>
                     <span id="hostfully-ical-report-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
                 </p>
                 <div id="hostfully-ical-report-table" style="margin-top:10px;"></div>
                 <pre id="hostfully-ical-report-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
+            </div>
+        </details>
+
+        <hr>
+
+        <details id="hostfully-step-ical-link" data-step="hostfully-step-ical-link">
+            <summary><strong>Step 8: Link Hostfully iCal Feeds into MotoPress</strong></summary>
+            <div style="margin-top:8px;">
+                <p>Looks up Hostfully iCal feeds and writes them to MotoPress external calendars for the matching accommodation unit.</p>
+                <p>
+                    <label for="hostfully-ical-link-limit" style="margin-right:8px;">Max properties to scan</label>
+                    <input id="hostfully-ical-link-limit" type="number" min="1" max="200" value="50" style="width:120px;">
+                    <button id="hostfully-ical-link-run" class="button" style="margin-left:8px;">Link iCal Feeds</button>
+                    <span id="hostfully-ical-link-status" style="margin-left:8px; color:#666;"></span>
+                    <span id="hostfully-ical-link-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                </p>
+                <label style="display:block; margin:-4px 0 10px;">
+                    <input type="checkbox" id="hostfully-ical-link-replace" value="1">
+                    Replace existing external calendars (overwrite)
+                </label>
+                <div id="hostfully-ical-link-table" style="margin-top:10px;"></div>
+                <pre id="hostfully-ical-link-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
             </div>
         </details>
 
@@ -3915,9 +4034,29 @@ add_action('wp_ajax_hostfully_mphb_ical_report', function () {
     if ($limit < 1) $limit = 1;
     if ($limit > 200) $limit = 200;
 
+    $offset = isset($_POST['offset']) ? (int)$_POST['offset'] : 0;
+    if ($offset < 0) $offset = 0;
+
+    $batch_size = isset($_POST['batch_size']) ? (int)$_POST['batch_size'] : 10;
+    if ($batch_size < 1) $batch_size = 1;
+    if ($batch_size > 50) $batch_size = 50;
+
     $log = [];
     $properties = hostfully_mphb_get_property_list_cached($log);
-    $properties = array_slice($properties, 0, $limit);
+    $total = min($limit, count($properties));
+    if ($offset >= $total) {
+        wp_send_json_success([
+            'items' => [],
+            'count' => 0,
+            'total' => $total,
+            'next_offset' => $offset,
+            'done' => true,
+            'log' => $log,
+        ]);
+    }
+
+    $properties = array_slice($properties, $offset, $batch_size);
+    $log[] = 'iCal audit batch: offset ' . $offset . ' size ' . count($properties) . ' (total ' . $total . ')';
 
     $items = [];
     foreach ($properties as $p) {
@@ -3956,9 +4095,197 @@ add_action('wp_ajax_hostfully_mphb_ical_report', function () {
         ];
     }
 
+    $next_offset = $offset + count($properties);
+
     wp_send_json_success([
         'items' => $items,
         'count' => count($items),
+        'total' => $total,
+        'next_offset' => $next_offset,
+        'done' => $next_offset >= $total,
+        'log' => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_link_icals', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    if (!function_exists('MPHB')) {
+        wp_send_json_error(['message' => 'MotoPress Hotel Booking not available.'], 400);
+    }
+
+    $limit = isset($_POST['limit']) ? (int)$_POST['limit'] : 50;
+    if ($limit < 1) $limit = 1;
+    if ($limit > 200) $limit = 200;
+
+    $offset = isset($_POST['offset']) ? (int)$_POST['offset'] : 0;
+    if ($offset < 0) $offset = 0;
+
+    $batch_size = isset($_POST['batch_size']) ? (int)$_POST['batch_size'] : 20;
+    if ($batch_size < 1) $batch_size = 1;
+    if ($batch_size > 50) $batch_size = 50;
+
+    $replace_existing = !empty($_POST['replace_existing']);
+
+    $log = [];
+    $properties = hostfully_mphb_get_property_list_cached($log);
+    $total = min($limit, count($properties));
+    if ($offset >= $total) {
+        wp_send_json_success([
+            'items' => [],
+            'count' => 0,
+            'total' => $total,
+            'next_offset' => $offset,
+            'done' => true,
+            'linked' => 0,
+            'skipped' => 0,
+            'missing_room' => 0,
+            'no_icals' => 0,
+            'errors' => 0,
+            'log' => $log,
+        ]);
+    }
+
+    $properties = array_slice($properties, $offset, $batch_size);
+    $log[] = 'iCal link batch: offset ' . $offset . ' size ' . count($properties) . ' (total ' . $total . ')';
+
+    $items = [];
+    $linked = 0;
+    $skipped = 0;
+    $missing_room = 0;
+    $no_icals = 0;
+    $errors = 0;
+
+    foreach ($properties as $p) {
+        if (!is_array($p) || empty($p['uid'])) continue;
+        $uid = (string)$p['uid'];
+        $name = (string)($p['name'] ?? 'Unnamed property');
+
+        $icals = hostfully_mphb_fetch_property_icals($uid, $log);
+        $ical_urls = [];
+        foreach ($icals as $ical) {
+            if (!is_array($ical)) continue;
+            foreach (['url', 'icalUrl', 'importUrl', 'exportUrl', 'link'] as $key) {
+                if (!empty($ical[$key]) && is_string($ical[$key])) {
+                    $ical_urls[] = $ical[$key];
+                }
+            }
+        }
+        $ical_urls = array_values(array_unique(array_filter($ical_urls)));
+
+        if (empty($ical_urls)) {
+            $no_icals++;
+            $skipped++;
+            $items[] = [
+                'uid' => $uid,
+                'name' => $name,
+                'room_id' => 0,
+                'ical_count' => 0,
+                'linked_count' => 0,
+                'status' => 'No iCal feeds found',
+            ];
+            continue;
+        }
+
+        $room_ids = get_posts([
+            'post_type' => 'mphb_room',
+            'meta_key' => '_hostfully_property_uid',
+            'meta_value' => $uid,
+            'fields' => 'ids',
+            'posts_per_page' => 1,
+        ]);
+        $room_id = !empty($room_ids) ? (int)$room_ids[0] : 0;
+
+        if (!$room_id) {
+            $missing_room++;
+            $skipped++;
+            $items[] = [
+                'uid' => $uid,
+                'name' => $name,
+                'room_id' => 0,
+                'ical_count' => count($ical_urls),
+                'linked_count' => 0,
+                'status' => 'Missing accommodation unit',
+            ];
+            continue;
+        }
+
+        try {
+            $room = MPHB()->getRoomRepository()->findById($room_id);
+            if (!$room) {
+                $missing_room++;
+                $skipped++;
+                $items[] = [
+                    'uid' => $uid,
+                    'name' => $name,
+                    'room_id' => $room_id,
+                    'ical_count' => count($ical_urls),
+                    'linked_count' => 0,
+                    'status' => 'Room not found',
+                ];
+                continue;
+            }
+
+            $existing_map = $room->getSyncUrls();
+            $existing_urls = is_array($existing_map) ? array_values($existing_map) : [];
+
+            if (!$replace_existing && !empty($existing_urls)) {
+                $skipped++;
+                $items[] = [
+                    'uid' => $uid,
+                    'name' => $name,
+                    'room_id' => $room_id,
+                    'ical_count' => count($ical_urls),
+                    'linked_count' => 0,
+                    'status' => 'Skipped (external calendars already set)',
+                ];
+                continue;
+            }
+
+            $merged = $replace_existing
+                ? $ical_urls
+                : array_values(array_unique(array_filter(array_merge($existing_urls, $ical_urls))));
+
+            $room->setSyncUrls($merged);
+
+            $linked_count = $replace_existing ? count($merged) : max(0, count($merged) - count($existing_urls));
+            $linked += $linked_count > 0 ? 1 : 0;
+
+            $items[] = [
+                'uid' => $uid,
+                'name' => $name,
+                'room_id' => $room_id,
+                'ical_count' => count($ical_urls),
+                'linked_count' => $linked_count,
+                'status' => $linked_count > 0 ? 'Linked' : 'No changes',
+            ];
+        } catch (Throwable $e) {
+            $errors++;
+            $items[] = [
+                'uid' => $uid,
+                'name' => $name,
+                'room_id' => $room_id,
+                'ical_count' => count($ical_urls),
+                'linked_count' => 0,
+                'status' => 'Error: ' . $e->getMessage(),
+            ];
+        }
+    }
+
+    $next_offset = $offset + count($properties);
+
+    wp_send_json_success([
+        'items' => $items,
+        'count' => count($items),
+        'total' => $total,
+        'next_offset' => $next_offset,
+        'done' => $next_offset >= $total,
+        'linked' => $linked,
+        'skipped' => $skipped,
+        'missing_room' => $missing_room,
+        'no_icals' => $no_icals,
+        'errors' => $errors,
         'log' => $log,
     ]);
 });

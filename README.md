@@ -17,6 +17,8 @@ This plugin pulls Hostfully properties into MotoPress Hotel Booking (WordPress) 
 - Single import for testing with the same log panel and spinner.
 - Import by UID list when the Hostfully property list endpoint is incomplete.
 - Compare pasted UIDs to already-imported ones and isolate missing entries.
+- iCal audit report to compare channel links vs available iCal feeds.
+- Link Hostfully iCal feeds into MotoPress external calendars (with safe skip/overwrite option).
 
 ## Requirements
 - WordPress 6.x
@@ -44,6 +46,43 @@ Go to **Hostfully Import** in WP Admin and set:
 3. **Import One** to verify configuration and output.
 4. **Bulk Import** to process all remaining properties.
 5. **Import by UID List** when Hostfully’s property list is incomplete. Use “Compare & Show Missing” to find what’s not yet imported.
+6. **iCal Links Audit** to see which properties have channel links but no iCal feeds.
+7. **Link iCal Feeds** to write Hostfully iCal URLs into MotoPress external calendars (skips rooms that already have calendars unless overwrite is checked).
+
+## Meta Fields Added
+These meta keys are stored on the Accommodation Type (mphb_room_type) and can be used in Elementor or custom templates.
+
+| Field | Meta Key |
+| --- | --- |
+| Hostfully property UID | _hostfully_property_uid |
+| Summary | _hostfully_desc_summary |
+| Short summary | _hostfully_desc_short_summary |
+| Access | _hostfully_desc_access |
+| Transit | _hostfully_desc_transit |
+| Interaction | _hostfully_desc_interaction |
+| Neighbourhood | _hostfully_desc_neighbourhood |
+| Space | _hostfully_desc_space |
+| House manual | _hostfully_desc_house_manual |
+| Notes | _hostfully_desc_notes |
+| Address line 1 | _hostfully_address_line1 |
+| Address line 2 | _hostfully_address_line2 |
+| City | _hostfully_city |
+| State/Region | _hostfully_state |
+| Postal code | _hostfully_postcode |
+| Country code | _hostfully_country_code |
+| Full address | _hostfully_full_address |
+| Latitude | _hostfully_lat |
+| Longitude | _hostfully_lng |
+| Max guests | _hostfully_max_guests |
+| Base guests | _hostfully_base_guests |
+| Beds | _hostfully_beds |
+
+Additional internal meta used by the importer:
+- _hostfully_photo_map (tracks Hostfully image UID to attachment mapping)
+- _hostfully_service_key (stored on imported services)
+- _hostfully_amenity_uid (stored on amenity terms)
+
+Usage note: The meta keys in the table above are intended for Elementor Dynamic Tags or custom templates. The internal meta keys listed here are used for import bookkeeping and should not be displayed.
 
 ## How Pricing Is Stored
 MotoPress rates use **season prices** to display in the UI. If no seasons exist, the importer auto-creates an **All Year** season and writes a base price there. This ensures rates show up immediately in the Rates screen without manual setup.
@@ -59,6 +98,7 @@ MotoPress rates use **season prices** to display in the UI. If no seasons exist,
 - iCal sync is not required for importing properties and rates.
 - Availability sync can be handled separately via MotoPress + external iCal setup.
 - If Hostfully’s `/properties` list does not return all properties, use the **Import by UID List** tool to fill the gaps.
+- External calendar syncing relies on MotoPress’s sync queue/cron, so verify it on your live domain if localhost appears stuck.
 
 ## Troubleshooting
 If something looks off:

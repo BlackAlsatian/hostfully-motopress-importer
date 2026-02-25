@@ -47,11 +47,19 @@
   const uidCompareBtn = document.getElementById('hostfully-uid-compare');
   const uidUseMissingBtn = document.getElementById('hostfully-uid-use-missing');
   const icalReportBtn = document.getElementById('hostfully-ical-report-run');
+  const icalReportCsvBtn = document.getElementById('hostfully-ical-report-csv');
   const icalReportLimit = document.getElementById('hostfully-ical-report-limit');
   const icalReportStatus = document.getElementById('hostfully-ical-report-status');
   const icalReportSpinner = document.getElementById('hostfully-ical-report-spinner');
   const icalReportTable = document.getElementById('hostfully-ical-report-table');
   const icalReportLog = document.getElementById('hostfully-ical-report-log');
+  const icalLinkBtn = document.getElementById('hostfully-ical-link-run');
+  const icalLinkLimit = document.getElementById('hostfully-ical-link-limit');
+  const icalLinkReplace = document.getElementById('hostfully-ical-link-replace');
+  const icalLinkStatus = document.getElementById('hostfully-ical-link-status');
+  const icalLinkSpinner = document.getElementById('hostfully-ical-link-spinner');
+  const icalLinkTable = document.getElementById('hostfully-ical-link-table');
+  const icalLinkLog = document.getElementById('hostfully-ical-link-log');
   const migrateBtn = document.getElementById('hostfully-migrate-start');
   const cleanupBtn = document.getElementById('hostfully-cleanup-terms');
   const wrapEl = document.querySelector('.wrap[data-next-action]');
@@ -77,6 +85,7 @@
   let propertiesLoaded = false;
   let loadingProperties = false;
   let toastTimer = null;
+  let lastIcalReportItems = [];
   function ensureToast() {
     let toast = document.getElementById('hostfully-toast');
     if (toast) return toast;
@@ -143,6 +152,15 @@
     }
   }
 
+  function setIcalLinkBusy(isBusy) {
+    if (!icalLinkSpinner) return;
+    if (isBusy) {
+      icalLinkSpinner.classList.add('is-active');
+    } else {
+      icalLinkSpinner.classList.remove('is-active');
+    }
+  }
+
   function renderIcalReport(items) {
     if (!icalReportTable) return;
     icalReportTable.innerHTML = '';
@@ -190,6 +208,120 @@
 
     table.appendChild(tbody);
     icalReportTable.appendChild(table);
+  }
+
+  function buildIcalCsv(items) {
+    const header = ['Property', 'UID', 'Channels', 'iCal count', 'Needs setup'];
+    const rows = [header.join(',')];
+    items.forEach((item) => {
+      const channels = (item.channels || []).join(' | ');
+      const row = [
+        csvEscape(item.name || ''),
+        csvEscape(item.uid || ''),
+        csvEscape(channels),
+        csvEscape(String(item.ical_count || 0)),
+        csvEscape(item.needs_setup ? 'Yes' : 'No'),
+      ];
+      rows.push(row.join(','));
+    });
+    return rows.join('\n');
+  }
+
+  function csvEscape(value) {
+    const text = value == null ? '' : String(value);
+    if (/[",\n]/.test(text)) {
+      return '"' + text.replace(/"/g, '""') + '"';
+    }
+    return text;
+  }
+
+  function downloadCsv(filename, csvText) {
+    const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
+
+  function appendIcalLog(lines) {
+    if (!icalReportLog || !lines || !lines.length) return;
+    const text = lines.join('\n');
+    if (icalReportLog.textContent) {
+      icalReportLog.textContent += '\n' + text;
+    } else {
+      icalReportLog.textContent = text;
+    }
+    icalReportLog.style.display = 'block';
+  }
+
+  function appendIcalLinkLog(lines) {
+    if (!icalLinkLog || !lines || !lines.length) return;
+    const text = lines.join('\n');
+    if (icalLinkLog.textContent) {
+      icalLinkLog.textContent += '\n' + text;
+    } else {
+      icalLinkLog.textContent = text;
+    }
+    icalLinkLog.style.display = 'block';
+  }
+
+  function renderIcalLinkReport(items) {
+    if (!icalLinkTable) return;
+    icalLinkTable.innerHTML = '';
+
+    const table = document.createElement('table');
+    table.className = 'widefat striped';
+    table.style.width = '100%';
+    table.style.maxWidth = '900px';
+    table.style.tableLayout = 'auto';
+
+    const thead = document.createElement('thead');
+    thead.innerHTML =
+      '<tr>' +
+      '<th style="width:220px;">Property</th>' +
+      '<th style="width:240px;">UID</th>' +
+      '<th style="width:70px;">Room ID</th>' +
+      '<th style="width:90px;">iCal count</th>' +
+      '<th style="width:90px;">Linked</th>' +
+      '<th>Status</th>' +
+      '</tr>';
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+
+    if (!items || !items.length) {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = 6;
+      cell.textContent = 'No properties processed.';
+      row.appendChild(cell);
+      tbody.appendChild(row);
+    } else {
+      items.forEach((item) => {
+        const row = document.createElement('tr');
+        row.innerHTML =
+          '<td style="white-space:normal; word-break:break-word;">' +
+          escapeHtml(item.name || 'Unnamed') +
+          '</td>' +
+          '<td style="white-space:normal; word-break:break-word;">' +
+          escapeHtml(item.uid || '') +
+          '</td>' +
+          '<td>' + escapeHtml(item.room_id ? String(item.room_id) : '-') + '</td>' +
+          '<td>' + escapeHtml(String(item.ical_count || 0)) + '</td>' +
+          '<td>' + escapeHtml(String(item.linked_count || 0)) + '</td>' +
+          '<td style="white-space:normal; word-break:break-word;">' +
+          escapeHtml(item.status || '-') +
+          '</td>';
+        tbody.appendChild(row);
+      });
+    }
+
+    table.appendChild(tbody);
+    icalLinkTable.appendChild(table);
   }
 
   function escapeHtml(value) {
@@ -290,45 +422,158 @@
     icalReportBtn.addEventListener('click', async function (e) {
       e.preventDefault();
       const limit = icalReportLimit ? parseInt(icalReportLimit.value, 10) : 50;
+      const batchSize = 10;
+      let offset = 0;
+      let allItems = [];
       if (icalReportStatus) icalReportStatus.textContent = 'Running…';
-      if (icalReportLog) icalReportLog.style.display = 'none';
+      if (icalReportLog) {
+        icalReportLog.textContent = '';
+        icalReportLog.style.display = 'none';
+      }
+      if (icalReportTable) icalReportTable.innerHTML = '';
       setIcalReportBusy(true);
       icalReportBtn.disabled = true;
 
-      let r = null;
-      try {
-        r = await post('hostfully_mphb_ical_report', {
-          limit: Number.isFinite(limit) ? String(limit) : '50',
-        });
-        if (r && r.success) markJsOk();
-      } catch (err) {
-        showError('iCal audit failed', err);
-        if (icalReportStatus) icalReportStatus.textContent = 'Failed';
-        setIcalReportBusy(false);
-        icalReportBtn.disabled = false;
-        return;
+      let done = false;
+      let total = Number.isFinite(limit) ? limit : 50;
+      while (!done) {
+        let r = null;
+        try {
+          r = await post('hostfully_mphb_ical_report', {
+            limit: Number.isFinite(limit) ? String(limit) : '50',
+            offset: String(offset),
+            batch_size: String(batchSize),
+          });
+          if (r && r.success) markJsOk();
+        } catch (err) {
+          showError('iCal audit failed', err);
+          if (icalReportStatus) icalReportStatus.textContent = 'Failed';
+          setIcalReportBusy(false);
+          icalReportBtn.disabled = false;
+          return;
+        }
+
+        if (!r || !r.success) {
+          showError('iCal audit failed', new Error('Unexpected response.'));
+          if (icalReportStatus) icalReportStatus.textContent = 'Failed';
+          setIcalReportBusy(false);
+          icalReportBtn.disabled = false;
+          return;
+        }
+
+        const data = r.data || {};
+        const items = data.items || [];
+        total = data.total || total;
+        allItems = allItems.concat(items);
+        if (data.log && data.log.length) appendIcalLog(data.log);
+
+        offset = Number.isFinite(data.next_offset) ? data.next_offset : offset + items.length;
+        done = !!data.done || offset >= total;
+
+        if (icalReportStatus) {
+          const checked = Math.min(offset, total);
+          icalReportStatus.textContent = `Checked ${checked} / ${total}`;
+        }
+
+        if (!done) await sleep(200);
       }
 
-      if (!r || !r.success) {
-        showError('iCal audit failed', new Error('Unexpected response.'));
-        if (icalReportStatus) icalReportStatus.textContent = 'Failed';
-        setIcalReportBusy(false);
-        icalReportBtn.disabled = false;
-        return;
-      }
-
-      const data = r.data || {};
-      const items = data.items || [];
-      renderIcalReport(items);
-      if (icalReportStatus) {
-        icalReportStatus.textContent = `Checked ${data.count || items.length}`;
-      }
-      if (icalReportLog && data.log && data.log.length) {
-        icalReportLog.textContent = data.log.join('\n');
-        icalReportLog.style.display = 'block';
-      }
+      renderIcalReport(allItems);
+      lastIcalReportItems = allItems;
       setIcalReportBusy(false);
       icalReportBtn.disabled = false;
+    });
+  }
+
+  if (icalLinkBtn) {
+    icalLinkBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      const limit = icalLinkLimit ? parseInt(icalLinkLimit.value, 10) : 50;
+      const batchSize = 10;
+      let offset = 0;
+      let allItems = [];
+      let totals = { linked: 0, skipped: 0, missing_room: 0, no_icals: 0, errors: 0 };
+
+      if (icalLinkStatus) icalLinkStatus.textContent = 'Running…';
+      if (icalLinkLog) {
+        icalLinkLog.textContent = '';
+        icalLinkLog.style.display = 'none';
+      }
+      if (icalLinkTable) icalLinkTable.innerHTML = '';
+      setIcalLinkBusy(true);
+      icalLinkBtn.disabled = true;
+
+      let done = false;
+      let total = Number.isFinite(limit) ? limit : 50;
+      while (!done) {
+        let r = null;
+        try {
+          r = await post('hostfully_mphb_link_icals', {
+            limit: Number.isFinite(limit) ? String(limit) : '50',
+            offset: String(offset),
+            batch_size: String(batchSize),
+            replace_existing: icalLinkReplace && icalLinkReplace.checked ? '1' : '',
+          });
+          if (r && r.success) markJsOk();
+        } catch (err) {
+          showError('iCal link failed', err);
+          if (icalLinkStatus) icalLinkStatus.textContent = 'Failed';
+          setIcalLinkBusy(false);
+          icalLinkBtn.disabled = false;
+          return;
+        }
+
+        if (!r || !r.success) {
+          showError('iCal link failed', new Error('Unexpected response.'));
+          if (icalLinkStatus) icalLinkStatus.textContent = 'Failed';
+          setIcalLinkBusy(false);
+          icalLinkBtn.disabled = false;
+          return;
+        }
+
+        const data = r.data || {};
+        const items = data.items || [];
+        total = data.total || total;
+        allItems = allItems.concat(items);
+        if (data.log && data.log.length) appendIcalLinkLog(data.log);
+
+        totals.linked += data.linked || 0;
+        totals.skipped += data.skipped || 0;
+        totals.missing_room += data.missing_room || 0;
+        totals.no_icals += data.no_icals || 0;
+        totals.errors += data.errors || 0;
+
+        offset = Number.isFinite(data.next_offset) ? data.next_offset : offset + items.length;
+        done = !!data.done || offset >= total;
+
+        if (icalLinkStatus) {
+          const checked = Math.min(offset, total);
+          icalLinkStatus.textContent =
+            `Linked ${totals.linked} | Checked ${checked} / ${total}`;
+        }
+
+        if (!done) await sleep(200);
+      }
+
+      renderIcalLinkReport(allItems);
+      setIcalLinkBusy(false);
+      icalLinkBtn.disabled = false;
+      showToast(`Linked ${totals.linked} rooms.`, 'success');
+    });
+  }
+
+  if (icalReportCsvBtn) {
+    icalReportCsvBtn.addEventListener('click', function (e) {
+      e.preventDefault();
+      if (!lastIcalReportItems.length) {
+        showToast('Run the iCal audit first.', 'error');
+        return;
+      }
+      const needsSetup = lastIcalReportItems.filter((item) => item.needs_setup);
+      const csv = buildIcalCsv(needsSetup);
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadCsv(`hostfully-ical-needs-setup-${stamp}.csv`, csv);
+      showToast(`Downloaded ${needsSetup.length} rows.`, 'success');
     });
   }
 
