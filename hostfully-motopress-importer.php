@@ -3466,38 +3466,9 @@ function hostfully_mphb_render_admin()
                     <input type="checkbox" id="hostfully-migrate-update-slugs" value="1">
                     Update slugs to match the new titles (accommodation type, rate, unit)
                 </label>
-                <div style="margin:8px 0 0; padding:10px; background:#f6f7f7; border:1px solid #ccd0d4; max-width:900px;">
-                    <strong>Cleanup options</strong>
-                    <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-cleanup-terms-opt" checked>
-                        Remove unused terms (amenities/tags/categories/attributes)
-                    </label>
-                    <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-cleanup-orphan-rates" checked>
-                        Remove orphan rates (no matching imported property UID)
-                    </label>
-                    <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-cleanup-orphan-rooms" checked>
-                        Remove orphan rooms (no matching imported property UID)
-                    </label>
-                    <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-cleanup-orphan-services" checked>
-                        Remove unused services (not assigned to any room type)
-                    </label>
-                    <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-cleanup-orphan-media" checked>
-                        Remove orphan media (hostfully images whose parent is missing)
-                    </label>
-                    <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-cleanup-attr-reg" checked>
-                        Clean attribute registry (remove unused or missing taxonomies)
-                    </label>
-                    <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-unpublish-missing" checked>
-                        Unpublish imports missing from Hostfully (set to draft)
-                    </label>
-                    <p class="description" style="margin:8px 0 0;">Tip: Unpublish missing properties compares current Hostfully list vs imported items.</p>
-                </div>
+                <p class="description" style="margin:8px 0 0; max-width:900px;">
+                    Cleanup now runs a default maintenance pass (unused terms + orphan rates/rooms/services/media + attribute registry cleanup).
+                </p>
             </div>
         </details>
 
@@ -3574,24 +3545,6 @@ function hostfully_mphb_render_admin()
                 </label>
                 <div id="hostfully-ical-link-table" style="margin-top:10px;"></div>
                 <pre id="hostfully-ical-link-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
-            </div>
-        </details>
-
-        <hr>
-
-        <details id="hostfully-step-location" data-step="hostfully-step-location">
-            <summary><strong>Step 9: Location Normalization Audit (Dry Run)</strong></summary>
-            <div style="margin-top:8px;">
-                <p>Previews location normalization changes (city/province aliases) without writing any terms.</p>
-                <p>
-                    <label for="hostfully-location-audit-limit" style="margin-right:8px;">Max properties to scan</label>
-                    <input id="hostfully-location-audit-limit" type="number" min="1" max="200" value="50" style="width:120px;">
-                    <button id="hostfully-location-audit-run" class="button" style="margin-left:8px;">Run Location Audit</button>
-                    <span id="hostfully-location-audit-status" style="margin-left:8px; color:#666;"></span>
-                    <span id="hostfully-location-audit-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
-                </p>
-                <div id="hostfully-location-audit-table" style="margin-top:10px;"></div>
-                <pre id="hostfully-location-audit-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
             </div>
         </details>
 
@@ -4178,115 +4131,6 @@ add_action('wp_ajax_hostfully_mphb_ical_report', function () {
     ]);
 });
 
-add_action('wp_ajax_hostfully_mphb_location_audit', function () {
-    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
-    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
-
-    $limit = isset($_POST['limit']) ? (int)$_POST['limit'] : 50;
-    if ($limit < 1) $limit = 1;
-    if ($limit > 200) $limit = 200;
-
-    $offset = isset($_POST['offset']) ? (int)$_POST['offset'] : 0;
-    if ($offset < 0) $offset = 0;
-
-    $batch_size = isset($_POST['batch_size']) ? (int)$_POST['batch_size'] : 10;
-    if ($batch_size < 1) $batch_size = 1;
-    if ($batch_size > 50) $batch_size = 50;
-
-    $log = [];
-    $properties = hostfully_mphb_get_property_list_cached($log);
-    $total = min($limit, count($properties));
-    if ($offset >= $total) {
-        wp_send_json_success([
-            'items' => [],
-            'count' => 0,
-            'total' => $total,
-            'next_offset' => $offset,
-            'done' => true,
-            'changed_count' => 0,
-            'log' => $log,
-        ]);
-    }
-
-    $properties = array_slice($properties, $offset, $batch_size);
-    $log[] = 'Location audit batch: offset ' . $offset . ' size ' . count($properties) . ' (total ' . $total . ')';
-
-    $items = [];
-    $changed_count = 0;
-    $detail_fallback_used = 0;
-    $detail_fallback_hits = 0;
-
-    foreach ($properties as $p) {
-        if (!is_array($p) || empty($p['uid'])) continue;
-        $uid = (string)$p['uid'];
-        $name = (string)($p['name'] ?? 'Unnamed property');
-
-        $property_for_location = $p;
-        $addr = $p['address'] ?? [];
-        $has_list_location = false;
-        if (is_array($addr)) {
-            $has_list_location = trim((string)($addr['city'] ?? '')) !== '' || trim((string)($addr['state'] ?? '')) !== '';
-        }
-        if (!$has_list_location) {
-            $detail_fallback_used++;
-            $detail_property = hostfully_mphb_fetch_property_detail($uid, $log);
-            if (!empty($detail_property)) {
-                $property_for_location = $detail_property;
-                $detail_fallback_hits++;
-            }
-        }
-
-        $location_meta = hostfully_mphb_get_location_normalization($property_for_location);
-        $changed = !empty($location_meta['changed']);
-        if ($changed) $changed_count++;
-
-        $reason = '';
-        $raw_state = (string)($location_meta['raw_state'] ?? '');
-        $state = (string)($location_meta['state'] ?? '');
-        $raw_city = (string)($location_meta['raw_city'] ?? '');
-        $city = (string)($location_meta['city'] ?? '');
-
-        if ($raw_state !== '' && $raw_state !== $state) {
-            $reason .= ($reason === '' ? '' : '; ') . 'State normalized';
-        }
-        if ($raw_city !== '' && $raw_city !== $city) {
-            $reason .= ($reason === '' ? '' : '; ') . 'City normalized';
-        }
-        if ($reason === '' && $changed) {
-            $reason = 'Whitespace cleanup';
-        }
-
-        $items[] = [
-            'uid' => $uid,
-            'name' => $name,
-            'raw_city' => $raw_city,
-            'raw_state' => $raw_state,
-            'city' => $city,
-            'state' => $state,
-            'raw_location' => (string)($location_meta['raw_location'] ?? ''),
-            'location' => (string)($location_meta['location'] ?? ''),
-            'changed' => $changed,
-            'reason' => $reason,
-        ];
-    }
-
-    $next_offset = $offset + count($properties);
-
-    if ($detail_fallback_used > 0) {
-        $log[] = 'Location audit detail fallback: requested ' . $detail_fallback_used . ', resolved ' . $detail_fallback_hits . '.';
-    }
-
-    wp_send_json_success([
-        'items' => $items,
-        'count' => count($items),
-        'total' => $total,
-        'next_offset' => $next_offset,
-        'done' => $next_offset >= $total,
-        'changed_count' => $changed_count,
-        'log' => $log,
-    ]);
-});
-
 add_action('wp_ajax_hostfully_mphb_link_icals', function () {
     if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
     check_ajax_referer('hostfully_mphb_ajax', 'nonce');
@@ -4475,13 +4319,13 @@ add_action('wp_ajax_hostfully_mphb_cleanup_terms', function () {
     check_ajax_referer('hostfully_mphb_ajax', 'nonce');
 
     $opts = [
-        'cleanup_terms' => !empty($_POST['cleanup_terms']),
-        'cleanup_orphan_rates' => !empty($_POST['cleanup_orphan_rates']),
-        'cleanup_orphan_rooms' => !empty($_POST['cleanup_orphan_rooms']),
-        'cleanup_orphan_services' => !empty($_POST['cleanup_orphan_services']),
-        'cleanup_orphan_media' => !empty($_POST['cleanup_orphan_media']),
-        'cleanup_attr_reg' => !empty($_POST['cleanup_attr_reg']),
-        'unpublish_missing' => !empty($_POST['unpublish_missing']),
+        'cleanup_terms' => true,
+        'cleanup_orphan_rates' => true,
+        'cleanup_orphan_rooms' => true,
+        'cleanup_orphan_services' => true,
+        'cleanup_orphan_media' => true,
+        'cleanup_attr_reg' => true,
+        'unpublish_missing' => false,
     ];
 
     $log = [];

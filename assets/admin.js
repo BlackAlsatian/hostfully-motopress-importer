@@ -53,12 +53,6 @@
   const icalLinkSpinner = document.getElementById('hostfully-ical-link-spinner');
   const icalLinkTable = document.getElementById('hostfully-ical-link-table');
   const icalLinkLog = document.getElementById('hostfully-ical-link-log');
-  const locationAuditBtn = document.getElementById('hostfully-location-audit-run');
-  const locationAuditLimit = document.getElementById('hostfully-location-audit-limit');
-  const locationAuditStatus = document.getElementById('hostfully-location-audit-status');
-  const locationAuditSpinner = document.getElementById('hostfully-location-audit-spinner');
-  const locationAuditTable = document.getElementById('hostfully-location-audit-table');
-  const locationAuditLog = document.getElementById('hostfully-location-audit-log');
   const migrateBtn = document.getElementById('hostfully-migrate-start');
   const cleanupBtn = document.getElementById('hostfully-cleanup-terms');
   const wrapEl = document.querySelector('.wrap[data-next-action]');
@@ -157,15 +151,6 @@
       icalLinkSpinner.classList.add('is-active');
     } else {
       icalLinkSpinner.classList.remove('is-active');
-    }
-  }
-
-  function setLocationAuditBusy(isBusy) {
-    if (!locationAuditSpinner) return;
-    if (isBusy) {
-      locationAuditSpinner.classList.add('is-active');
-    } else {
-      locationAuditSpinner.classList.remove('is-active');
     }
   }
 
@@ -277,17 +262,6 @@
     icalLinkLog.style.display = 'block';
   }
 
-  function appendLocationAuditLog(lines) {
-    if (!locationAuditLog || !lines || !lines.length) return;
-    const text = lines.join('\n');
-    if (locationAuditLog.textContent) {
-      locationAuditLog.textContent += '\n' + text;
-    } else {
-      locationAuditLog.textContent = text;
-    }
-    locationAuditLog.style.display = 'block';
-  }
-
   function renderIcalLinkReport(items) {
     if (!icalLinkTable) return;
     icalLinkTable.innerHTML = '';
@@ -341,65 +315,6 @@
 
     table.appendChild(tbody);
     icalLinkTable.appendChild(table);
-  }
-
-  function renderLocationAudit(items) {
-    if (!locationAuditTable) return;
-    locationAuditTable.innerHTML = '';
-
-    const table = document.createElement('table');
-    table.className = 'widefat striped';
-    table.style.width = '100%';
-    table.style.maxWidth = '1000px';
-    table.style.tableLayout = 'auto';
-
-    const thead = document.createElement('thead');
-    thead.innerHTML =
-      '<tr>' +
-      '<th style="width:220px;">Property</th>' +
-      '<th style="width:220px;">UID</th>' +
-      '<th style="width:180px;">Raw location</th>' +
-      '<th style="width:180px;">Normalized location</th>' +
-      '<th style="width:90px;">Changed</th>' +
-      '<th>Reason</th>' +
-      '</tr>';
-    table.appendChild(thead);
-
-    const tbody = document.createElement('tbody');
-
-    if (!items || !items.length) {
-      const row = document.createElement('tr');
-      const cell = document.createElement('td');
-      cell.colSpan = 6;
-      cell.textContent = 'No properties processed.';
-      row.appendChild(cell);
-      tbody.appendChild(row);
-    } else {
-      items.forEach((item) => {
-        const row = document.createElement('tr');
-        row.innerHTML =
-          '<td style="white-space:normal; word-break:break-word;">' +
-          escapeHtml(item.name || 'Unnamed') +
-          '</td>' +
-          '<td style="white-space:normal; word-break:break-word;">' +
-          escapeHtml(item.uid || '') +
-          '</td>' +
-          '<td style="white-space:normal; word-break:break-word;">' +
-          escapeHtml(item.raw_location || '-') +
-          '</td>' +
-          '<td style="white-space:normal; word-break:break-word;">' +
-          escapeHtml(item.location || '-') +
-          '</td>' +
-          '<td>' + escapeHtml(item.changed ? 'Yes' : 'No') + '</td>' +
-          '<td style="white-space:normal; word-break:break-word;">' +
-          escapeHtml(item.reason || '-') +
-          '</td>';
-        tbody.appendChild(row);
-      });
-    }
-
-    table.appendChild(tbody);
-    locationAuditTable.appendChild(table);
   }
 
   function escapeHtml(value) {
@@ -637,77 +552,6 @@
       setIcalLinkBusy(false);
       icalLinkBtn.disabled = false;
       showToast(`Linked ${totals.linked} rooms.`, 'success');
-    });
-  }
-
-  if (locationAuditBtn) {
-    locationAuditBtn.addEventListener('click', async function (e) {
-      e.preventDefault();
-      const limit = locationAuditLimit ? parseInt(locationAuditLimit.value, 10) : 50;
-      const batchSize = 10;
-      let offset = 0;
-      let allItems = [];
-      let totalChanged = 0;
-
-      if (locationAuditStatus) locationAuditStatus.textContent = 'Running…';
-      if (locationAuditLog) {
-        locationAuditLog.textContent = '';
-        locationAuditLog.style.display = 'none';
-      }
-      if (locationAuditTable) locationAuditTable.innerHTML = '';
-      setLocationAuditBusy(true);
-      locationAuditBtn.disabled = true;
-
-      let done = false;
-      let total = Number.isFinite(limit) ? limit : 50;
-
-      while (!done) {
-        let r = null;
-        try {
-          r = await post('hostfully_mphb_location_audit', {
-            limit: Number.isFinite(limit) ? String(limit) : '50',
-            offset: String(offset),
-            batch_size: String(batchSize),
-          });
-          if (r && r.success) markJsOk();
-        } catch (err) {
-          showError('Location audit failed', err);
-          if (locationAuditStatus) locationAuditStatus.textContent = 'Failed';
-          setLocationAuditBusy(false);
-          locationAuditBtn.disabled = false;
-          return;
-        }
-
-        if (!r || !r.success) {
-          showError('Location audit failed', new Error('Unexpected response.'));
-          if (locationAuditStatus) locationAuditStatus.textContent = 'Failed';
-          setLocationAuditBusy(false);
-          locationAuditBtn.disabled = false;
-          return;
-        }
-
-        const data = r.data || {};
-        const items = data.items || [];
-        total = data.total || total;
-        allItems = allItems.concat(items);
-        totalChanged += data.changed_count || 0;
-        if (data.log && data.log.length) appendLocationAuditLog(data.log);
-
-        offset = Number.isFinite(data.next_offset) ? data.next_offset : offset + items.length;
-        done = !!data.done || offset >= total;
-
-        if (locationAuditStatus) {
-          const checked = Math.min(offset, total);
-          locationAuditStatus.textContent = `Changed ${totalChanged} | Checked ${checked} / ${total}`;
-        }
-
-        if (!done) await sleep(200);
-      }
-
-      renderLocationAudit(allItems);
-      setLocationAuditBusy(false);
-      locationAuditBtn.disabled = false;
-      showToast(`Location audit complete. ${totalChanged} change(s) found.`, 'success');
     });
   }
 
@@ -1117,29 +961,15 @@
   if (cleanupBtn) {
     cleanupBtn.addEventListener('click', async function (e) {
       e.preventDefault();
-      const optTerms = document.getElementById('hostfully-cleanup-terms-opt');
-      const optRates = document.getElementById('hostfully-cleanup-orphan-rates');
-      const optRooms = document.getElementById('hostfully-cleanup-orphan-rooms');
-      const optServices = document.getElementById('hostfully-cleanup-orphan-services');
-      const optMedia = document.getElementById('hostfully-cleanup-orphan-media');
-      const optAttrReg = document.getElementById('hostfully-cleanup-attr-reg');
-      const optUnpublish = document.getElementById('hostfully-unpublish-missing');
-
       const payload = {
-        cleanup_terms: optTerms && optTerms.checked ? '1' : '0',
-        cleanup_orphan_rates: optRates && optRates.checked ? '1' : '0',
-        cleanup_orphan_rooms: optRooms && optRooms.checked ? '1' : '0',
-        cleanup_orphan_services: optServices && optServices.checked ? '1' : '0',
-        cleanup_orphan_media: optMedia && optMedia.checked ? '1' : '0',
-        cleanup_attr_reg: optAttrReg && optAttrReg.checked ? '1' : '0',
-        unpublish_missing: optUnpublish && optUnpublish.checked ? '1' : '0',
+        cleanup_terms: '1',
+        cleanup_orphan_rates: '1',
+        cleanup_orphan_rooms: '1',
+        cleanup_orphan_services: '1',
+        cleanup_orphan_media: '1',
+        cleanup_attr_reg: '1',
+        unpublish_missing: '0',
       };
-
-      const anySelected = Object.values(payload).some((v) => v === '1');
-      if (!anySelected) {
-        showError('Cleanup', new Error('Select at least one cleanup option.'));
-        return;
-      }
 
       const ok = window.confirm('Cleanup will remove or unpublish data based on the selected options. Continue?');
       if (!ok) return;
