@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer (Temporary)
  * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.34
+ * Version: 0.35
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
