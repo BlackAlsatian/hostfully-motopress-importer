@@ -283,101 +283,87 @@ function hostfully_mphb_get_properties_with_log(array &$log): array
     $limit  = min(100, max(1, (int)($cfg['api_page_limit'] ?? 100)));
     $all    = [];
     $seen   = []; // dedupe by uid, just in case
+    $cursor = '';
+    $offset = 0;
 
-    $statuses = ['ACTIVE'];
-    if ($include_inactive) {
-        // Try common status filters. Dedupe by uid across all.
-        $statuses = ['ACTIVE', 'INACTIVE', 'ARCHIVED', 'DELETED', 'DISABLED', 'DRAFT', 'ALL'];
-    }
+    // Hard safety limit: 500 pages
+    for ($i = 0; $i < 500; $i++) {
+        $url = add_query_arg([
+            'agencyUid' => $cfg['agency_uid'],
+            '_limit'    => $limit,
+        ], $base);
 
-    foreach ($statuses as $status_filter) {
-        $cursor = '';
-        $offset = 0;
-
-        // Hard safety limit: 500 pages per status
-        for ($i = 0; $i < 500; $i++) {
+        if ($include_inactive) {
             $url = add_query_arg([
-                'agencyUid' => $cfg['agency_uid'],
-                '_limit'    => $limit,
-            ], $base);
-            if ($include_inactive) {
-                $url = add_query_arg([
-                    'includeInactive' => 'true',
-                ], $url);
-            }
-            if (!empty($status_filter) && $status_filter !== 'ACTIVE') {
-                $url = add_query_arg(['status' => $status_filter], $url);
-            } elseif ($include_inactive && $status_filter === 'ALL') {
-                $url = add_query_arg(['status' => 'ALL'], $url);
-            }
+                'includeInactive' => 'true',
+            ], $url);
+        }
 
-            if ($cursor !== '') {
-                $url = add_query_arg(['_cursor' => $cursor], $url);
-            } elseif ($offset > 0) {
-                $url = add_query_arg(['_offset' => $offset], $url);
-            }
+        if ($cursor !== '') {
+            $url = add_query_arg(['_cursor' => $cursor], $url);
+        } elseif ($offset > 0) {
+            $url = add_query_arg(['_offset' => $offset], $url);
+        }
 
-            $headers = [];
-            $status  = 0;
-            $raw     = '';
-            $data = hostfully_mphb_api_get_json($url, $headers, $status, $raw);
+        $headers = [];
+        $status  = 0;
+        $raw     = '';
+        $data = hostfully_mphb_api_get_json($url, $headers, $status, $raw);
 
-            if (is_wp_error($data)) {
-                if ($verbose) {
-                    $log[] = 'Properties fetch failed: ' . $data->get_error_message();
-                    $log[] = 'Properties URL: ' . $url . ' (HTTP ' . $status . ')';
-                }
-                break;
-            }
-
-            $page = $data['properties'] ?? $data['items'] ?? [];
-            if (!is_array($page) || empty($page)) {
-                if ($verbose && $i === 0) {
-                    $log[] = 'Properties fetch returned empty page for status ' . $status_filter . '.';
-                }
-                break;
-            }
-
-            $next_cursor = hostfully_mphb_extract_next_cursor($data, $headers);
+        if (is_wp_error($data)) {
             if ($verbose) {
-                if ($i === 0) {
-                    $meta_count = $data['_metadata']['count'] ?? null;
-                    $meta_total = $data['_metadata']['totalCount'] ?? null;
-                    if ($meta_count !== null || $meta_total !== null) {
-                        $log[] = 'Properties metadata (' . $status_filter . '): count ' . (string)$meta_count . ', totalCount ' . (string)$meta_total;
-                    }
-                }
-                $log[] = sprintf(
-                    'Properties page %d (%s): HTTP %d, items %d, next_cursor %s, offset %d',
-                    $i + 1,
-                    $status_filter,
-                    $status,
-                    count($page),
-                    $next_cursor !== '' ? $next_cursor : '(none)',
-                    $offset
-                );
+                $log[] = 'Properties fetch failed: ' . $data->get_error_message();
+                $log[] = 'Properties URL: ' . $url . ' (HTTP ' . $status . ')';
             }
-
-            foreach ($page as $p) {
-                $uid = (string)($p['uid'] ?? '');
-                if (!$uid || isset($seen[$uid])) continue;
-                $seen[$uid] = true;
-                $all[] = $p;
-            }
-
-            if ($next_cursor !== '' && $next_cursor !== $cursor) {
-                $cursor = $next_cursor;
-                $offset = 0;
-                continue;
-            }
-
-            if (count($page) >= $limit) {
-                $offset += $limit;
-                continue;
-            }
-
             break;
         }
+
+        $page = $data['properties'] ?? $data['items'] ?? [];
+        if (!is_array($page) || empty($page)) {
+            if ($verbose && $i === 0) {
+                $log[] = 'Properties fetch returned empty first page.';
+            }
+            break;
+        }
+
+        $next_cursor = hostfully_mphb_extract_next_cursor($data, $headers);
+        if ($verbose) {
+            if ($i === 0) {
+                $meta_count = $data['_metadata']['count'] ?? null;
+                $meta_total = $data['_metadata']['totalCount'] ?? null;
+                if ($meta_count !== null || $meta_total !== null) {
+                    $log[] = 'Properties metadata: count ' . (string)$meta_count . ', totalCount ' . (string)$meta_total;
+                }
+            }
+            $log[] = sprintf(
+                'Properties page %d: HTTP %d, items %d, next_cursor %s, offset %d',
+                $i + 1,
+                $status,
+                count($page),
+                $next_cursor !== '' ? $next_cursor : '(none)',
+                $offset
+            );
+        }
+
+        foreach ($page as $p) {
+            $uid = (string)($p['uid'] ?? '');
+            if (!$uid || isset($seen[$uid])) continue;
+            $seen[$uid] = true;
+            $all[] = $p;
+        }
+
+        if ($next_cursor !== '' && $next_cursor !== $cursor) {
+            $cursor = $next_cursor;
+            $offset = 0;
+            continue;
+        }
+
+        if (count($page) >= $limit) {
+            $offset += $limit;
+            continue;
+        }
+
+        break;
     }
 
     return $all;
@@ -537,6 +523,35 @@ function hostfully_mphb_fetch_property_channel_links(string $property_uid, array
     if (!empty($data['propertyChannelLinks']) && is_array($data['propertyChannelLinks'])) return $data['propertyChannelLinks'];
     if (!empty($data['items']) && is_array($data['items'])) return $data['items'];
     return [];
+}
+
+function hostfully_mphb_fetch_property_detail(string $property_uid, array &$log): array
+{
+    if ($property_uid === '') return [];
+
+    $cfg = hostfully_mphb_settings();
+    if (empty($cfg['agency_uid'])) return [];
+
+    $url = rtrim($cfg['base_url'], '/') . '/properties/' . urlencode($property_uid);
+    $url = add_query_arg(['agencyUid' => $cfg['agency_uid']], $url);
+
+    $response = hostfully_mphb_api_get($url);
+    if (is_wp_error($response)) {
+        hostfully_mphb_log_debug($log, 'Property detail fetch failed for ' . $property_uid . ': ' . $response->get_error_message());
+        return [];
+    }
+
+    $status = (int)wp_remote_retrieve_response_code($response);
+    $body   = (string)wp_remote_retrieve_body($response);
+    $data   = json_decode($body, true);
+    $property = $data['property'] ?? null;
+
+    if ($status !== 200 || !is_array($data) || !is_array($property)) {
+        hostfully_mphb_log_debug($log, 'Property detail fetch invalid for ' . $property_uid . ' (HTTP ' . $status . ').');
+        return [];
+    }
+
+    return $property;
 }
 
 function hostfully_mphb_update_text_meta(int $post_id, string $key, $value): void
@@ -3519,10 +3534,6 @@ function hostfully_mphb_render_admin()
                         Clean attribute registry (remove unused or missing taxonomies)
                     </label>
                     <label style="display:block; margin:6px 0 0;">
-                        <input type="checkbox" id="hostfully-cleanup-clear-cats-tags">
-                        Clear categories/tags from imported accommodations
-                    </label>
-                    <label style="display:block; margin:6px 0 0;">
                         <input type="checkbox" id="hostfully-unpublish-missing" checked>
                         Unpublish imports missing from Hostfully (set to draft)
                     </label>
@@ -4243,13 +4254,30 @@ add_action('wp_ajax_hostfully_mphb_location_audit', function () {
 
     $items = [];
     $changed_count = 0;
+    $detail_fallback_used = 0;
+    $detail_fallback_hits = 0;
 
     foreach ($properties as $p) {
         if (!is_array($p) || empty($p['uid'])) continue;
         $uid = (string)$p['uid'];
         $name = (string)($p['name'] ?? 'Unnamed property');
 
-        $location_meta = hostfully_mphb_get_location_normalization($p);
+        $property_for_location = $p;
+        $addr = $p['address'] ?? [];
+        $has_list_location = false;
+        if (is_array($addr)) {
+            $has_list_location = trim((string)($addr['city'] ?? '')) !== '' || trim((string)($addr['state'] ?? '')) !== '';
+        }
+        if (!$has_list_location) {
+            $detail_fallback_used++;
+            $detail_property = hostfully_mphb_fetch_property_detail($uid, $log);
+            if (!empty($detail_property)) {
+                $property_for_location = $detail_property;
+                $detail_fallback_hits++;
+            }
+        }
+
+        $location_meta = hostfully_mphb_get_location_normalization($property_for_location);
         $changed = !empty($location_meta['changed']);
         if ($changed) $changed_count++;
 
@@ -4284,6 +4312,10 @@ add_action('wp_ajax_hostfully_mphb_location_audit', function () {
     }
 
     $next_offset = $offset + count($properties);
+
+    if ($detail_fallback_used > 0) {
+        $log[] = 'Location audit detail fallback: requested ' . $detail_fallback_used . ', resolved ' . $detail_fallback_hits . '.';
+    }
 
     wp_send_json_success([
         'items' => $items,
@@ -4490,7 +4522,6 @@ add_action('wp_ajax_hostfully_mphb_cleanup_terms', function () {
         'cleanup_orphan_services' => !empty($_POST['cleanup_orphan_services']),
         'cleanup_orphan_media' => !empty($_POST['cleanup_orphan_media']),
         'cleanup_attr_reg' => !empty($_POST['cleanup_attr_reg']),
-        'cleanup_clear_cats_tags' => !empty($_POST['cleanup_clear_cats_tags']),
         'unpublish_missing' => !empty($_POST['unpublish_missing']),
     ];
 
@@ -4515,9 +4546,6 @@ add_action('wp_ajax_hostfully_mphb_cleanup_terms', function () {
     }
     if (!empty($opts['cleanup_attr_reg'])) {
         $result['attribute_registry'] = hostfully_mphb_cleanup_attribute_registry($log);
-    }
-    if (!empty($opts['cleanup_clear_cats_tags'])) {
-        $result['clear_cats_tags'] = hostfully_mphb_clear_categories_tags_from_imports($log);
     }
     if (!empty($opts['unpublish_missing'])) {
         $result['unpublish_missing'] = hostfully_mphb_unpublish_missing_properties($log);

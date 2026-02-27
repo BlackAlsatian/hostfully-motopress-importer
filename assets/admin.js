@@ -1130,7 +1130,6 @@
       const optServices = document.getElementById('hostfully-cleanup-orphan-services');
       const optMedia = document.getElementById('hostfully-cleanup-orphan-media');
       const optAttrReg = document.getElementById('hostfully-cleanup-attr-reg');
-      const optClearCatsTags = document.getElementById('hostfully-cleanup-clear-cats-tags');
       const optUnpublish = document.getElementById('hostfully-unpublish-missing');
 
       const payload = {
@@ -1140,7 +1139,6 @@
         cleanup_orphan_services: optServices && optServices.checked ? '1' : '0',
         cleanup_orphan_media: optMedia && optMedia.checked ? '1' : '0',
         cleanup_attr_reg: optAttrReg && optAttrReg.checked ? '1' : '0',
-        cleanup_clear_cats_tags: optClearCatsTags && optClearCatsTags.checked ? '1' : '0',
         unpublish_missing: optUnpublish && optUnpublish.checked ? '1' : '0',
       };
 
