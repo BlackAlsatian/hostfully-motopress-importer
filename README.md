@@ -9,7 +9,7 @@ This plugin pulls Hostfully properties into MotoPress Hotel Booking (WordPress) 
 - Imports Hostfully properties as MotoPress Accommodation Types.
 - Creates Rates and Accommodation Units per property.
 - Syncs and assigns amenities to the MotoPress amenities taxonomy.
-- Maps categories/tags based on Hostfully property metadata.
+- Maps categories/tags based on Hostfully property metadata, plus links `property_type` as category and `location` as tag for MotoPress templating.
 - Creates and assigns Room Attributes (beds, bedrooms, bathrooms, guests).
 - Downloads featured images and gallery photos with a configurable limit.
 - Ensures an “All Year” season exists and writes season prices so rates display in the UI.
@@ -19,6 +19,7 @@ This plugin pulls Hostfully properties into MotoPress Hotel Booking (WordPress) 
 - Compare pasted UIDs to already-imported ones and isolate missing entries.
 - iCal audit report to compare channel links vs available iCal feeds.
 - Link Hostfully iCal feeds into MotoPress external calendars (with safe skip/overwrite option).
+- Dry-run location normalization audit to preview city/province term changes before import writes.
 
 ## Requirements
 - WordPress 6.x
@@ -48,6 +49,7 @@ Go to **Hostfully Import** in WP Admin and set:
 5. **Import by UID List** when Hostfully’s property list is incomplete. Use “Compare & Show Missing” to find what’s not yet imported.
 6. **iCal Links Audit** to see which properties have channel links but no iCal feeds.
 7. **Link iCal Feeds** to write Hostfully iCal URLs into MotoPress external calendars (skips rooms that already have calendars unless overwrite is checked).
+8. **Location Normalization Audit (Dry Run)** to preview location changes (e.g., `WC` → `Western Cape`, `Port Elizabeth` → `Gqeberha`) with no writes.
 
 ## Meta Fields Added
 These meta keys are stored on the Accommodation Type (mphb_room_type) and can be used in Elementor or custom templates.
@@ -99,6 +101,8 @@ MotoPress rates use **season prices** to display in the UI. If no seasons exist,
 - Availability sync can be handled separately via MotoPress + external iCal setup.
 - If Hostfully’s `/properties` list does not return all properties, use the **Import by UID List** tool to fill the gaps.
 - External calendar syncing relies on MotoPress’s sync queue/cron, so verify it on your live domain if localhost appears stuck.
+- Location attribute terms now normalize common South African aliases during import to reduce duplicate filter values.
+- The normalized `location` attribute is also linked to room type tags, and `property_type` is linked to room type categories.
 
 ## Troubleshooting
 If something looks off:

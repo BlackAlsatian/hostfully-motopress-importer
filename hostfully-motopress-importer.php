@@ -290,13 +290,9 @@ function hostfully_mphb_get_properties_with_log(array &$log): array
         $statuses = ['ACTIVE', 'INACTIVE', 'ARCHIVED', 'DELETED', 'DISABLED', 'DRAFT', 'ALL'];
     }
 
-    $status_summaries = [];
-
     foreach ($statuses as $status_filter) {
         $cursor = '';
         $offset = 0;
-        $status_item_count = 0;
-        $status_first_uid = '';
 
         // Hard safety limit: 500 pages per status
         for ($i = 0; $i < 500; $i++) {
@@ -362,14 +358,6 @@ function hostfully_mphb_get_properties_with_log(array &$log): array
                 );
             }
 
-            $status_item_count += count($page);
-            if ($status_first_uid === '') {
-                $first = $page[0] ?? null;
-                if (is_array($first) && !empty($first['uid'])) {
-                    $status_first_uid = (string)$first['uid'];
-                }
-            }
-
             foreach ($page as $p) {
                 $uid = (string)($p['uid'] ?? '');
                 if (!$uid || isset($seen[$uid])) continue;
@@ -389,35 +377,6 @@ function hostfully_mphb_get_properties_with_log(array &$log): array
             }
 
             break;
-        }
-
-        if ($verbose) {
-            $log[] = sprintf(
-                'Status filter %s summary: items %d, first_uid %s',
-                $status_filter,
-                $status_item_count,
-                $status_first_uid !== '' ? $status_first_uid : '(none)'
-            );
-        }
-
-        $status_summaries[] = [
-            'status' => $status_filter,
-            'items' => $status_item_count,
-            'first_uid' => $status_first_uid,
-        ];
-    }
-
-    if ($verbose && $include_inactive && count($status_summaries) > 1) {
-        $baseline = $status_summaries[0];
-        $all_same = true;
-        foreach ($status_summaries as $s) {
-            if ($s['items'] !== $baseline['items'] || $s['first_uid'] !== $baseline['first_uid']) {
-                $all_same = false;
-                break;
-            }
-        }
-        if ($all_same) {
-            $log[] = 'Warning: status filters appear to be ignored by the Hostfully API (responses look identical).';
         }
     }
 
@@ -1801,6 +1760,25 @@ function hostfully_mphb_import_categories_tags(int $room_type_id, array $propert
     $category_terms = $extract_terms($property['categories'] ?? []);
     $tag_terms      = $extract_terms($property['tags'] ?? []);
 
+    // Also map importer attributes for MotoPress templating compatibility:
+    // - property_type attribute -> room type category
+    // - location attribute      -> room type tag
+    $attr_vals = hostfully_mphb_get_property_attribute_values($property);
+    $attr_property_type = isset($attr_vals['property_type']) ? trim((string)$attr_vals['property_type']) : '';
+    $attr_location = isset($attr_vals['location']) ? trim((string)$attr_vals['location']) : '';
+    if ($attr_property_type !== '') {
+        $category_terms[] = $attr_property_type;
+    }
+    if ($attr_location !== '') {
+        $tag_terms[] = $attr_location;
+    }
+    if ($attr_property_type !== '' || $attr_location !== '') {
+        $parts = [];
+        if ($attr_property_type !== '') $parts[] = 'property_type→category: ' . $attr_property_type;
+        if ($attr_location !== '') $parts[] = 'location→tag: ' . $attr_location;
+        $log[] = 'Template taxonomy link: ' . implode(' | ', $parts);
+    }
+
     $category_terms = array_values(array_unique(array_filter(array_map('trim', $category_terms))));
     $tag_terms      = array_values(array_unique(array_filter(array_map('trim', $tag_terms))));
 
@@ -2107,6 +2085,112 @@ function hostfully_mphb_sum_numeric_array($value): ?float
     return $found ? $sum : null;
 }
 
+function hostfully_mphb_normalize_location_token(string $value): string
+{
+    $value = trim($value);
+    if ($value === '') return '';
+    return preg_replace('/\s+/u', ' ', $value) ?? $value;
+}
+
+function hostfully_mphb_normalize_city_name(string $city, string $country_code = ''): string
+{
+    $city = hostfully_mphb_normalize_location_token($city);
+    if ($city === '') return '';
+
+    $key = strtoupper($city);
+    $country = strtoupper(trim($country_code));
+
+    if ($country === 'ZA') {
+        $map = [
+            'PORT ELIZABETH' => 'Gqeberha',
+            'GQEBERHA' => 'Gqeberha',
+        ];
+        if (isset($map[$key])) return $map[$key];
+    }
+
+    return $city;
+}
+
+function hostfully_mphb_normalize_state_name(string $state, string $country_code = ''): string
+{
+    $state = hostfully_mphb_normalize_location_token($state);
+    if ($state === '') return '';
+
+    $key = strtoupper($state);
+    $country = strtoupper(trim($country_code));
+
+    if ($country === 'ZA') {
+        $map = [
+            'WC' => 'Western Cape',
+            'WESTERN CAPE' => 'Western Cape',
+            'EC' => 'Eastern Cape',
+            'EASTERN CAPE' => 'Eastern Cape',
+            'NC' => 'Northern Cape',
+            'NORTHERN CAPE' => 'Northern Cape',
+            'FS' => 'Free State',
+            'FREE STATE' => 'Free State',
+            'KZN' => 'KwaZulu-Natal',
+            'KWAZULU NATAL' => 'KwaZulu-Natal',
+            'KWAZULU-NATAL' => 'KwaZulu-Natal',
+            'NW' => 'North West',
+            'NORTH WEST' => 'North West',
+            'GP' => 'Gauteng',
+            'GAUTENG' => 'Gauteng',
+            'MP' => 'Mpumalanga',
+            'MPUMALANGA' => 'Mpumalanga',
+            'LP' => 'Limpopo',
+            'LIMPOPO' => 'Limpopo',
+        ];
+        if (isset($map[$key])) return $map[$key];
+    }
+
+    return $state;
+}
+
+function hostfully_mphb_get_location_normalization(array $property): array
+{
+    $addr = $property['address'] ?? [];
+    if (!is_array($addr)) {
+        return [
+            'raw_city' => '',
+            'raw_state' => '',
+            'city' => '',
+            'state' => '',
+            'raw_location' => '',
+            'location' => '',
+            'changed' => false,
+        ];
+    }
+
+    $country_code = (string)($addr['countryCode'] ?? '');
+    $raw_city = hostfully_mphb_normalize_location_token((string)($addr['city'] ?? ''));
+    $raw_state = hostfully_mphb_normalize_location_token((string)($addr['state'] ?? ''));
+
+    $city = hostfully_mphb_normalize_city_name($raw_city, $country_code);
+    $state = hostfully_mphb_normalize_state_name($raw_state, $country_code);
+
+    $raw_parts = [];
+    if ($raw_city !== '') $raw_parts[] = $raw_city;
+    if ($raw_state !== '') $raw_parts[] = $raw_state;
+
+    $normalized_parts = [];
+    if ($city !== '') $normalized_parts[] = $city;
+    if ($state !== '') $normalized_parts[] = $state;
+
+    $raw_location = implode(', ', $raw_parts);
+    $location = implode(', ', $normalized_parts);
+
+    return [
+        'raw_city' => $raw_city,
+        'raw_state' => $raw_state,
+        'city' => $city,
+        'state' => $state,
+        'raw_location' => $raw_location,
+        'location' => $location,
+        'changed' => ($raw_location !== $location),
+    ];
+}
+
 function hostfully_mphb_get_property_attribute_values(array $property): array
 {
     $vals = [];
@@ -2182,14 +2266,9 @@ function hostfully_mphb_get_property_attribute_values(array $property): array
         $vals['size'] = ['value' => $size_ft2, 'unit' => 'sqft'];
     }
 
-    $location_parts = [];
-    $addr = $property['address'] ?? [];
-    if (is_array($addr)) {
-        if (!empty($addr['city'])) $location_parts[] = (string)$addr['city'];
-        if (!empty($addr['state'])) $location_parts[] = (string)$addr['state'];
-    }
-    if (!empty($location_parts)) {
-        $vals['location'] = implode(', ', $location_parts);
+    $location_meta = hostfully_mphb_get_location_normalization($property);
+    if (!empty($location_meta['location'])) {
+        $vals['location'] = (string)$location_meta['location'];
     }
 
     $ptype = $property['propertyType'] ?? '';
@@ -2344,6 +2423,11 @@ function hostfully_mphb_format_attribute_term(string $key, $value): string
 
 function hostfully_mphb_import_attributes(int $room_type_id, array $property, array &$log): void
 {
+    $location_meta = hostfully_mphb_get_location_normalization($property);
+    if (!empty($location_meta['changed'])) {
+        $log[] = 'Attributes: location normalized "' . $location_meta['raw_location'] . '" → "' . $location_meta['location'] . '".';
+    }
+
     $vals = hostfully_mphb_get_property_attribute_values($property);
     if (!empty($vals)) {
         // Drop zero/empty numeric values (e.g., Beds: 0) to avoid junk terms.
@@ -2542,7 +2626,6 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
 
     $log[] = '---';
     $log[] = 'Importing property UID: ' . $property_uid;
-    hostfully_mphb_log_debug($log, 'Import debug: started at ' . date('c'));
 
     $existing_post_id = hostfully_mphb_find_existing_post_id($property_uid);
     $log[] = 'Existing post ID: ' . ($existing_post_id ?: 'none');
@@ -3526,6 +3609,24 @@ function hostfully_mphb_render_admin()
 
         <hr>
 
+        <details id="hostfully-step-location" data-step="hostfully-step-location">
+            <summary><strong>Step 9: Location Normalization Audit (Dry Run)</strong></summary>
+            <div style="margin-top:8px;">
+                <p>Previews location normalization changes (city/province aliases) without writing any terms.</p>
+                <p>
+                    <label for="hostfully-location-audit-limit" style="margin-right:8px;">Max properties to scan</label>
+                    <input id="hostfully-location-audit-limit" type="number" min="1" max="200" value="50" style="width:120px;">
+                    <button id="hostfully-location-audit-run" class="button" style="margin-left:8px;">Run Location Audit</button>
+                    <span id="hostfully-location-audit-status" style="margin-left:8px; color:#666;"></span>
+                    <span id="hostfully-location-audit-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                </p>
+                <div id="hostfully-location-audit-table" style="margin-top:10px;"></div>
+                <pre id="hostfully-location-audit-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
+            </div>
+        </details>
+
+        <hr>
+
         <details id="hostfully-step-meta" data-step="hostfully-step-meta">
             <summary><strong>Reference: Elementor Meta Helper</strong></summary>
             <div style="margin-top:8px;">
@@ -4103,6 +4204,94 @@ add_action('wp_ajax_hostfully_mphb_ical_report', function () {
         'total' => $total,
         'next_offset' => $next_offset,
         'done' => $next_offset >= $total,
+        'log' => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_location_audit', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $limit = isset($_POST['limit']) ? (int)$_POST['limit'] : 50;
+    if ($limit < 1) $limit = 1;
+    if ($limit > 200) $limit = 200;
+
+    $offset = isset($_POST['offset']) ? (int)$_POST['offset'] : 0;
+    if ($offset < 0) $offset = 0;
+
+    $batch_size = isset($_POST['batch_size']) ? (int)$_POST['batch_size'] : 10;
+    if ($batch_size < 1) $batch_size = 1;
+    if ($batch_size > 50) $batch_size = 50;
+
+    $log = [];
+    $properties = hostfully_mphb_get_property_list_cached($log);
+    $total = min($limit, count($properties));
+    if ($offset >= $total) {
+        wp_send_json_success([
+            'items' => [],
+            'count' => 0,
+            'total' => $total,
+            'next_offset' => $offset,
+            'done' => true,
+            'changed_count' => 0,
+            'log' => $log,
+        ]);
+    }
+
+    $properties = array_slice($properties, $offset, $batch_size);
+    $log[] = 'Location audit batch: offset ' . $offset . ' size ' . count($properties) . ' (total ' . $total . ')';
+
+    $items = [];
+    $changed_count = 0;
+
+    foreach ($properties as $p) {
+        if (!is_array($p) || empty($p['uid'])) continue;
+        $uid = (string)$p['uid'];
+        $name = (string)($p['name'] ?? 'Unnamed property');
+
+        $location_meta = hostfully_mphb_get_location_normalization($p);
+        $changed = !empty($location_meta['changed']);
+        if ($changed) $changed_count++;
+
+        $reason = '';
+        $raw_state = (string)($location_meta['raw_state'] ?? '');
+        $state = (string)($location_meta['state'] ?? '');
+        $raw_city = (string)($location_meta['raw_city'] ?? '');
+        $city = (string)($location_meta['city'] ?? '');
+
+        if ($raw_state !== '' && $raw_state !== $state) {
+            $reason .= ($reason === '' ? '' : '; ') . 'State normalized';
+        }
+        if ($raw_city !== '' && $raw_city !== $city) {
+            $reason .= ($reason === '' ? '' : '; ') . 'City normalized';
+        }
+        if ($reason === '' && $changed) {
+            $reason = 'Whitespace cleanup';
+        }
+
+        $items[] = [
+            'uid' => $uid,
+            'name' => $name,
+            'raw_city' => $raw_city,
+            'raw_state' => $raw_state,
+            'city' => $city,
+            'state' => $state,
+            'raw_location' => (string)($location_meta['raw_location'] ?? ''),
+            'location' => (string)($location_meta['location'] ?? ''),
+            'changed' => $changed,
+            'reason' => $reason,
+        ];
+    }
+
+    $next_offset = $offset + count($properties);
+
+    wp_send_json_success([
+        'items' => $items,
+        'count' => count($items),
+        'total' => $total,
+        'next_offset' => $next_offset,
+        'done' => $next_offset >= $total,
+        'changed_count' => $changed_count,
         'log' => $log,
     ]);
 });
