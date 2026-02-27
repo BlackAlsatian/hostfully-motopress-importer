@@ -3305,30 +3305,8 @@ function hostfully_mphb_render_admin()
     $last_error    = hostfully_mphb_get_last_error();
     $amenity_map   = hostfully_mphb_get_amenity_map();
 
-    $next_action_label = '';
-    $next_action_link = '';
-    $next_action_hint = '';
-    $next_action_step = '';
-
-    if (empty($cfg['api_key']) || empty($cfg['agency_uid'])) {
-        $next_action_label = 'Save API settings';
-        $next_action_link = '#hostfully-step-settings';
-    } elseif (empty($amenity_map) || !is_array($amenity_map)) {
-        $next_action_label = 'Sync amenities catalog';
-        $next_action_link = '#hostfully-step-sync';
-    } elseif (empty($imported_uids)) {
-        $next_action_label = 'Import one property';
-        $next_action_link = '#hostfully-step-one';
-    } else {
-        $next_action_label = 'Run bulk import';
-        $next_action_link = '#hostfully-step-bulk';
-        $next_action_hint = 'Use Migration & Cleanup if you want to update existing imports.';
-    }
-    if ($next_action_link !== '') {
-        $next_action_step = ltrim($next_action_link, '#');
-    }
 ?>
-    <div class="wrap" data-next-action="<?= esc_attr($next_action_step); ?>">
+    <div class="wrap">
         <h1>Hostfully → MotoPress Import</h1>
 
         <?php if (!empty($last_error)): ?>
@@ -3340,24 +3318,6 @@ function hostfully_mphb_render_admin()
                 </form>
             </div>
         <?php endif; ?>
-
-        <h2>Workflow</h2>
-        <ol>
-            <li><a href="#hostfully-step-settings">Save API settings</a>.</li>
-            <li><a href="#hostfully-step-sync">Sync amenities catalog</a> (recommended once).</li>
-            <li><a href="#hostfully-step-one">Import one property</a> to validate.</li>
-            <li><a href="#hostfully-step-bulk">Bulk import</a> the rest.</li>
-            <li><a href="#hostfully-step-migrate">Migration & cleanup</a> if needed.</li>
-        </ol>
-        <?php if ($next_action_label && $next_action_link): ?>
-            <div class="notice notice-info" style="margin:12px 0;">
-                <p><strong>Next recommended action:</strong> <a href="<?= esc_url($next_action_link); ?>"><?= esc_html($next_action_label); ?></a>.</p>
-                <?php if ($next_action_hint): ?>
-                    <p class="description" style="margin:0;"><?= esc_html($next_action_hint); ?></p>
-                <?php endif; ?>
-            </div>
-        <?php endif; ?>
-        <p class="description">Tip: If you need to optimize large images, do it after import using an optimizer plugin or a separate batch job.</p>
 
         <hr>
 
@@ -3489,7 +3449,6 @@ function hostfully_mphb_render_admin()
                     <pre id="hostfully-log" style="white-space:pre-wrap; margin-top:10px;"></pre>
                     <div id="hostfully-summary" style="display:none; margin-top:10px; padding:8px; background:#f6f7f7; border:1px solid #ccd0d4;"></div>
                 </div>
-                <p id="hostfully-js-indicator" style="margin-top:8px; color:#666; font-size:12px;">JS status: not loaded</p>
             </div>
         </details>
 
