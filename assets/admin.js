@@ -5,6 +5,7 @@
   const statusEl = document.getElementById('hostfully-status');
   const logEl = document.getElementById('hostfully-log');
   const summaryEl = document.getElementById('hostfully-summary');
+  const jsIndicator = document.getElementById('hostfully-js-indicator');
   const spinner = document.getElementById('hostfully-spinner');
   const counterEl = document.getElementById('hostfully-counter');
 
