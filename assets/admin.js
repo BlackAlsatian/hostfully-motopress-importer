@@ -1009,6 +1009,7 @@
 
 
   const syncAmenitiesBtn = document.getElementById('hostfully-sync-amenities');
+  const syncGuestCapacityBtn = document.getElementById('hostfully-sync-guest-capacity');
   if (syncAmenitiesBtn) {
     syncAmenitiesBtn.addEventListener('click', async function (e) {
       e.preventDefault();
@@ -1042,6 +1043,43 @@
       statusEl.textContent = `Amenities synced ✅ (processed: ${total})`;
       setBusy(false);
       syncAmenitiesBtn.disabled = false;
+    });
+  }
+
+  if (syncGuestCapacityBtn) {
+    syncGuestCapacityBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      wrap.style.display = 'block';
+      statusEl.textContent = 'Syncing guest capacity…';
+      appendLog(['—', 'Starting guest capacity sync…']);
+      setBusy(true);
+
+      syncGuestCapacityBtn.disabled = true;
+
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_sync_guest_capacity');
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('Guest capacity sync failed', err);
+        syncGuestCapacityBtn.disabled = false;
+        return;
+      }
+      if (!r || !r.success) {
+        statusEl.textContent = 'Guest capacity sync error';
+        setBusy(false);
+        appendLog(['Guest capacity sync failed.', JSON.stringify(r)]);
+        syncGuestCapacityBtn.disabled = false;
+        return;
+      }
+
+      const d = r.data || {};
+      appendLog([...(d.log || [])]);
+      const updated = (d.result && Number.isFinite(d.result.updated)) ? d.result.updated : 0;
+      const scanned = (d.result && Number.isFinite(d.result.scanned)) ? d.result.scanned : 0;
+      statusEl.textContent = `Guest capacity synced ✅ (${updated}/${scanned} updated)`;
+      setBusy(false);
+      syncGuestCapacityBtn.disabled = false;
     });
   }
 

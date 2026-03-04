@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer (Temporary)
  * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.35
+ * Version: 0.36
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -3236,6 +3236,69 @@ function hostfully_mphb_cleanup_attribute_registry(array &$log): int
     return $deleted;
 }
 
+function hostfully_mphb_sync_guest_capacity(array &$log): array
+{
+    $posts = get_posts([
+        'post_type'      => 'mphb_room_type',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'meta_query'     => [
+            [
+                'key'     => '_hostfully_property_uid',
+                'compare' => 'EXISTS',
+            ],
+        ],
+        'fields' => 'ids',
+    ]);
+
+    $scanned = 0;
+    $updated = 0;
+    $skipped = 0;
+
+    foreach ($posts as $post_id) {
+        $post_id = (int)$post_id;
+        $scanned++;
+
+        $max_guests = get_post_meta($post_id, '_hostfully_max_guests', true);
+        $base_guests = get_post_meta($post_id, '_hostfully_base_guests', true);
+        $beds = get_post_meta($post_id, '_hostfully_beds', true);
+
+        $guests = hostfully_mphb_extract_number($max_guests);
+        if ($guests === null) $guests = hostfully_mphb_extract_number($base_guests);
+        if ($guests === null) $guests = hostfully_mphb_extract_number($beds);
+
+        if ($guests === null || $guests <= 0) {
+            $skipped++;
+            continue;
+        }
+
+        $guests_int = max(1, (int)round($guests));
+        $base_adults = hostfully_mphb_extract_number($base_guests);
+        $base_adults_int = $base_adults !== null && $base_adults > 0
+            ? max(1, min($guests_int, (int)round($base_adults)))
+            : $guests_int;
+
+        update_post_meta($post_id, 'mphb_adults', $guests_int);
+        update_post_meta($post_id, 'mphb_children', 0);
+
+        update_post_meta($post_id, 'mphb_adults_capacity', $guests_int);
+        update_post_meta($post_id, 'mphb_children_capacity', 0);
+        update_post_meta($post_id, 'mphb_total_capacity', $guests_int);
+        update_post_meta($post_id, 'mphb_base_adults_capacity', $base_adults_int);
+        update_post_meta($post_id, 'mphb_base_children_capacity', 0);
+
+        $updated++;
+    }
+
+    $log[] = 'Guest capacity sync: scanned ' . $scanned . ', updated ' . $updated . ', skipped ' . $skipped . '.';
+
+    return [
+        'scanned' => $scanned,
+        'updated' => $updated,
+        'skipped' => $skipped,
+    ];
+}
+
 function hostfully_mphb_unpublish_missing_properties(array &$log): int
 {
     $hostfully = hostfully_mphb_get_properties_with_log($log);
@@ -3389,7 +3452,9 @@ function hostfully_mphb_render_admin()
 
                 <p>
                     <button id="hostfully-sync-amenities" class="button">Sync Amenities Catalog</button>
+                    <button id="hostfully-sync-guest-capacity" class="button" style="margin-left:8px;">Sync Guest Capacity</button>
                 </p>
+                <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Guest Capacity updates imported accommodations to guests-only mode (`adults = guests`, `children = 0`) and aligns MotoPress capacity fields.</p>
             </div>
         </details>
 
@@ -4372,6 +4437,19 @@ add_action('wp_ajax_hostfully_mphb_sync_amenities', function () {
 
     $log = [];
     $res = hostfully_mphb_sync_amenities_catalog_safe($log);
+
+    wp_send_json_success([
+        'result' => $res,
+        'log'    => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_sync_guest_capacity', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $log = [];
+    $res = hostfully_mphb_sync_guest_capacity($log);
 
     wp_send_json_success([
         'result' => $res,
