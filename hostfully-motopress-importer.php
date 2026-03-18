@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer (Temporary)
  * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.36
+ * Version: 0.37
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -525,7 +525,7 @@ function hostfully_mphb_fetch_property_channel_links(string $property_uid, array
     return [];
 }
 
-function hostfully_mphb_fetch_property_detail(string $property_uid, array &$log): array
+function hostfully_mphb_fetch_property_detail(string $property_uid, array &$log, int &$http_status = 0): array
 {
     if ($property_uid === '') return [];
 
@@ -538,10 +538,12 @@ function hostfully_mphb_fetch_property_detail(string $property_uid, array &$log)
     $response = hostfully_mphb_api_get($url);
     if (is_wp_error($response)) {
         hostfully_mphb_log_debug($log, 'Property detail fetch failed for ' . $property_uid . ': ' . $response->get_error_message());
+        $http_status = 0;
         return [];
     }
 
     $status = (int)wp_remote_retrieve_response_code($response);
+    $http_status = $status;
     $body   = (string)wp_remote_retrieve_body($response);
     $data   = json_decode($body, true);
     $property = $data['property'] ?? null;
@@ -552,6 +554,32 @@ function hostfully_mphb_fetch_property_detail(string $property_uid, array &$log)
     }
 
     return $property;
+}
+
+function hostfully_mphb_mark_property_stale(int $post_id, string $property_uid, array &$log, string $context = ''): bool
+{
+    if ($post_id < 1) return false;
+
+    $current_status = get_post_status($post_id);
+    if ($current_status === 'draft') {
+        $log[] = 'Stale property already drafted: post ' . $post_id . ' (UID ' . $property_uid . ').';
+        return true;
+    }
+
+    $res = wp_update_post([
+        'ID' => $post_id,
+        'post_status' => 'draft',
+    ], true);
+
+    if (is_wp_error($res)) {
+        $prefix = $context !== '' ? $context . ': ' : '';
+        $log[] = $prefix . 'failed to draft stale property ' . $post_id . ' (UID ' . $property_uid . '): ' . $res->get_error_message();
+        return false;
+    }
+
+    $prefix = $context !== '' ? $context . ': ' : '';
+    $log[] = $prefix . 'drafted stale property ' . $post_id . ' (UID ' . $property_uid . ').';
+    return true;
 }
 
 function hostfully_mphb_update_text_meta(int $post_id, string $key, $value): void
@@ -2525,9 +2553,24 @@ function hostfully_mphb_import_attributes(int $room_type_id, array $property, ar
     hostfully_mphb_cleanup_legacy_bedroom_term($log);
 }
 
-function hostfully_mphb_upsert_service(string $key, string $title, float $price, array &$log): int
+function hostfully_mphb_upsert_service(string $key, string $title, float $price, array &$log, array $service_args = []): int
 {
     $existing_id = 0;
+    $service_key = isset($service_args['service_key']) && is_string($service_args['service_key']) && $service_args['service_key'] !== ''
+        ? $service_args['service_key']
+        : $key;
+    $post_title = isset($service_args['post_title']) && is_string($service_args['post_title']) && $service_args['post_title'] !== ''
+        ? $service_args['post_title']
+        : $title;
+    $periodicity = isset($service_args['periodicity']) && is_string($service_args['periodicity']) && $service_args['periodicity'] !== ''
+        ? $service_args['periodicity']
+        : 'once';
+    $price_quantity = isset($service_args['price_quantity']) && is_string($service_args['price_quantity']) && $service_args['price_quantity'] !== ''
+        ? $service_args['price_quantity']
+        : 'once';
+    $min_quantity = array_key_exists('min_quantity', $service_args) ? (string)$service_args['min_quantity'] : '1';
+    $max_quantity = array_key_exists('max_quantity', $service_args) ? (string)$service_args['max_quantity'] : '0';
+    $is_auto_limit = !empty($service_args['is_auto_limit']) ? '1' : '0';
 
     // Find by meta key
     $q = new WP_Query([
@@ -2535,7 +2578,7 @@ function hostfully_mphb_upsert_service(string $key, string $title, float $price,
         'posts_per_page' => 1,
         'post_status'    => 'any',
         'meta_key'       => '_hostfully_service_key',
-        'meta_value'     => $key,
+        'meta_value'     => $service_key,
         'fields'         => 'ids',
     ]);
 
@@ -2544,7 +2587,7 @@ function hostfully_mphb_upsert_service(string $key, string $title, float $price,
     $args = [
         'post_type'   => 'mphb_room_service',
         'post_status' => 'publish',
-        'post_title'  => $title,
+        'post_title'  => $post_title,
     ];
     if ($existing_id) $args['ID'] = $existing_id;
 
@@ -2556,84 +2599,198 @@ function hostfully_mphb_upsert_service(string $key, string $title, float $price,
 
     $service_id = (int)$service_id;
 
-    update_post_meta($service_id, '_hostfully_service_key', $key);
+    update_post_meta($service_id, '_hostfully_service_key', $service_key);
+    if (isset($service_args['property_uid']) && is_string($service_args['property_uid']) && $service_args['property_uid'] !== '') {
+        update_post_meta($service_id, '_hostfully_property_uid', $service_args['property_uid']);
+    }
+    if (isset($service_args['fee_type']) && is_string($service_args['fee_type']) && $service_args['fee_type'] !== '') {
+        update_post_meta($service_id, '_hostfully_fee_type', $service_args['fee_type']);
+    }
 
     // Mirror MotoPress service meta shape (from your dump)
     update_post_meta($service_id, 'mphb_price', (string)(int)round($price));
-    update_post_meta($service_id, 'mphb_price_periodicity', 'once');
-    update_post_meta($service_id, 'mphb_min_quantity', '1');
-    update_post_meta($service_id, 'mphb_is_auto_limit', '0');
-    update_post_meta($service_id, 'mphb_max_quantity', '0');
-    update_post_meta($service_id, 'mphb_price_quantity', 'once');
+    update_post_meta($service_id, 'mphb_price_periodicity', $periodicity);
+    update_post_meta($service_id, 'mphb_min_quantity', $min_quantity);
+    update_post_meta($service_id, 'mphb_is_auto_limit', $is_auto_limit);
+    update_post_meta($service_id, 'mphb_max_quantity', $max_quantity);
+    update_post_meta($service_id, 'mphb_price_quantity', $price_quantity);
 
     $log[] = ($existing_id ? 'Updated service OK: ' : 'Created service OK: ') . $service_id . " ({$title})";
 
     return $service_id;
 }
 
-function hostfully_mphb_assign_services_to_room_type(int $room_type_id, array $service_ids, array &$log): void
+function hostfully_mphb_get_room_type_service_ids(int $room_type_id): array
+{
+    $existing_raw = get_post_meta($room_type_id, 'mphb_services', true);
+    $existing = is_array($existing_raw) ? $existing_raw : maybe_unserialize($existing_raw);
+    if (!is_array($existing)) return [];
+
+    $service_ids = [];
+    foreach ($existing as $service_id) {
+        $service_id = (int)$service_id;
+        if ($service_id) $service_ids[] = $service_id;
+    }
+
+    return array_values(array_unique($service_ids));
+}
+
+function hostfully_mphb_store_room_type_service_ids(int $room_type_id, array $service_ids, array &$log, string $message = 'Services assigned (mphb_services): '): void
 {
     $service_ids = array_values(array_unique(array_filter(array_map('intval', $service_ids))));
-    if (empty($service_ids)) return;
+    $stored = array_map('strval', $service_ids);
+    update_post_meta($room_type_id, 'mphb_services', $stored);
+    $log[] = $message . (!empty($stored) ? implode(', ', $stored) : '(none)');
+}
 
-    // Existing services may come back already unserialized (WP auto-unserializes post meta).
-    // Older installs may store a serialized string. Handle both safely.
-    $existing_raw = get_post_meta($room_type_id, 'mphb_services', true);
+function hostfully_mphb_fee_specs(): array
+{
+    return [
+        'cleaningFee' => [
+            'title' => 'Cleaning Fee',
+            'periodicity' => 'once',
+            'price_quantity' => 'once',
+        ],
+        'securityDeposit' => [
+            'title' => 'Security Deposit',
+            'periodicity' => 'once',
+            'price_quantity' => 'once',
+        ],
+        'extraGuestFee' => [
+            'title' => 'Extra Guest Fee',
+            'periodicity' => 'once',
+            'price_quantity' => 'once',
+        ],
+    ];
+}
 
-    if (is_array($existing_raw)) {
-        $existing = $existing_raw;
+function hostfully_mphb_known_pricing_keys(): array
+{
+    return [
+        'dailyRate',
+        'currency',
+        'cleaningFee',
+        'securityDeposit',
+        'extraGuestFee',
+    ];
+}
+
+function hostfully_mphb_is_imported_fee_service(int $service_id): bool
+{
+    if ($service_id < 1) return false;
+
+    $fee_type = get_post_meta($service_id, '_hostfully_fee_type', true);
+    if (is_string($fee_type) && $fee_type !== '') return true;
+
+    $service_key = get_post_meta($service_id, '_hostfully_service_key', true);
+    if (!is_string($service_key) || $service_key === '') return false;
+
+    if (strpos($service_key, 'fee:') === 0) return true;
+
+    return in_array($service_key, array_keys(hostfully_mphb_fee_specs()), true);
+}
+
+function hostfully_mphb_sync_property_fees(int $room_type_id, array $property, array &$log, array &$unknown_pricing_keys = []): array
+{
+    $property_uid = trim((string)($property['uid'] ?? ''));
+    if ($room_type_id < 1 || $property_uid === '') {
+        return [
+            'assigned' => 0,
+            'removed' => 0,
+            'prices' => [],
+        ];
+    }
+
+    $pricing = $property['pricing'] ?? [];
+    if (!is_array($pricing)) $pricing = [];
+
+    $room_type_title = get_the_title($room_type_id);
+    $property_name = is_string($room_type_title) ? trim($room_type_title) : '';
+    if ($property_name === '') {
+        $property_name = trim((string)($property['name'] ?? 'Imported Property'));
+    }
+    $fee_specs = hostfully_mphb_fee_specs();
+    $prices = [];
+    $new_fee_service_ids = [];
+
+    foreach ($fee_specs as $fee_key => $spec) {
+        $value = $pricing[$fee_key] ?? null;
+        $amount = hostfully_mphb_extract_number($value);
+        $meta_key = '_hostfully_' . strtolower(preg_replace('/(?<!^)[A-Z]/', '_$0', $fee_key) ?? $fee_key);
+
+        if ($amount !== null && $amount > 0) {
+            update_post_meta($room_type_id, $meta_key, (string)$amount);
+            $prices[$fee_key] = (float)$amount;
+
+            $new_fee_service_ids[] = hostfully_mphb_upsert_service(
+                $fee_key,
+                (string)$spec['title'],
+                (float)$amount,
+                $log,
+                [
+                    'service_key' => 'fee:' . $property_uid . ':' . $fee_key,
+                    'post_title' => $property_name . ' - ' . $spec['title'],
+                    'property_uid' => $property_uid,
+                    'fee_type' => $fee_key,
+                    'periodicity' => (string)$spec['periodicity'],
+                    'price_quantity' => (string)$spec['price_quantity'],
+                    'min_quantity' => '1',
+                    'max_quantity' => '0',
+                    'is_auto_limit' => false,
+                ]
+            );
+        } else {
+            delete_post_meta($room_type_id, $meta_key);
+        }
+    }
+
+    $kept_service_ids = [];
+    $removed = 0;
+    foreach (hostfully_mphb_get_room_type_service_ids($room_type_id) as $service_id) {
+        if (hostfully_mphb_is_imported_fee_service($service_id)) {
+            $removed++;
+            continue;
+        }
+        $kept_service_ids[] = $service_id;
+    }
+
+    $final_service_ids = array_merge($kept_service_ids, array_values(array_filter(array_map('intval', $new_fee_service_ids))));
+    hostfully_mphb_store_room_type_service_ids($room_type_id, $final_service_ids, $log, 'Fee services synced (mphb_services): ');
+
+    foreach ($pricing as $pricing_key => $_value) {
+        if (!is_string($pricing_key) || in_array($pricing_key, hostfully_mphb_known_pricing_keys(), true)) continue;
+        if (!isset($unknown_pricing_keys[$pricing_key])) $unknown_pricing_keys[$pricing_key] = 0;
+        $unknown_pricing_keys[$pricing_key]++;
+    }
+
+    if (!empty($prices)) {
+        $parts = [];
+        foreach ($prices as $fee_key => $amount) {
+            $parts[] = $fee_key . '=' . $amount;
+        }
+        $log[] = 'Fee sync: ' . implode(' | ', $parts);
     } else {
-        $existing = maybe_unserialize($existing_raw);
+        $log[] = 'Fee sync: no known Hostfully fee values found.';
     }
 
-    if (!is_array($existing)) {
-        $existing = [];
-    }
+    return [
+        'assigned' => count(array_filter(array_map('intval', $new_fee_service_ids))),
+        'removed' => $removed,
+        'prices' => $prices,
+    ];
+}
 
-    $existing = array_map('strval', $existing);
-
-    foreach ($service_ids as $sid) {
-        $existing[] = (string)$sid;
-    }
-
-    $existing = array_values(array_unique($existing));
-
-    // Let WP handle serialization.
-    update_post_meta($room_type_id, 'mphb_services', $existing);
-
-    $log[] = 'Services assigned (mphb_services): ' . implode(', ', $existing);
+function hostfully_mphb_assign_services_to_room_type(int $room_type_id, array $service_ids, array &$log): void
+{
+    $existing = hostfully_mphb_get_room_type_service_ids($room_type_id);
+    $final = array_merge($existing, $service_ids);
+    hostfully_mphb_store_room_type_service_ids($room_type_id, $final, $log);
 }
 
 function hostfully_mphb_import_services(int $room_type_id, array $property, array &$log): void
 {
-    // Hostfully doesn't explicitly call these "services" in the property payload.
-    // We treat common fee fields as services so the WP side mirrors Hostfully's pricing model.
-    $pricing = $property['pricing'] ?? [];
-    if (!is_array($pricing)) $pricing = [];
-
-    $service_ids = [];
-
-    if (!empty($pricing['cleaningFee']) && (float)$pricing['cleaningFee'] > 0) {
-        $service_ids[] = hostfully_mphb_upsert_service('cleaningFee', 'Cleaning Fee', (float)$pricing['cleaningFee'], $log);
-    }
-
-    if (!empty($pricing['securityDeposit']) && (float)$pricing['securityDeposit'] > 0) {
-        $service_ids[] = hostfully_mphb_upsert_service('securityDeposit', 'Security Deposit', (float)$pricing['securityDeposit'], $log);
-    }
-
-    // Extra guest fee is often per-extra-guest-per-night in Hostfully.
-    // MotoPress supports extra adult/child pricing inside Rates; we may migrate it there later.
-    if (!empty($pricing['extraGuestFee']) && (float)$pricing['extraGuestFee'] > 0) {
-        $service_ids[] = hostfully_mphb_upsert_service('extraGuestFee', 'Extra Guest Fee', (float)$pricing['extraGuestFee'], $log);
-    }
-
-    $service_ids = array_values(array_filter(array_map('intval', $service_ids)));
-    if (empty($service_ids)) {
-        $log[] = 'Services: none found in Hostfully pricing.';
-        return;
-    }
-
-    hostfully_mphb_assign_services_to_room_type($room_type_id, $service_ids, $log);
+    $unknown_pricing_keys = [];
+    hostfully_mphb_sync_property_fees($room_type_id, $property, $log, $unknown_pricing_keys);
 }
 function hostfully_mphb_import_property(string $property_uid, array &$log): int
 {
@@ -2662,6 +2819,9 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     hostfully_mphb_log_debug($log, 'Detail HTTP: ' . (int)$status . ' (bytes: ' . strlen((string)$body) . ').');
 
     if ($status !== 200 || !is_array($data) || !$property || empty($property['uid'])) {
+        if ((int)$status === 404 && $existing_post_id) {
+            hostfully_mphb_mark_property_stale((int)$existing_post_id, $property_uid, $log, 'Import');
+        }
         $log[] = 'Detail invalid. HTTP: ' . $status;
         $log[] = 'Raw detail body: ' . $body;
         return 0;
@@ -3299,6 +3459,92 @@ function hostfully_mphb_sync_guest_capacity(array &$log): array
     ];
 }
 
+function hostfully_mphb_sync_property_fees_for_imports(int $offset, int $batch_size, array &$log): array
+{
+    $posts = get_posts([
+        'post_type'      => 'mphb_room_type',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'meta_query'     => [
+            [
+                'key'     => '_hostfully_property_uid',
+                'compare' => 'EXISTS',
+            ],
+        ],
+        'fields' => 'ids',
+    ]);
+
+    $total = count($posts);
+    if ($offset < 0) $offset = 0;
+    if ($batch_size < 1) $batch_size = 10;
+    $posts = array_slice($posts, $offset, $batch_size);
+
+    $processed = 0;
+    $updated = 0;
+    $skipped = 0;
+    $errors = 0;
+    $unknown_pricing_keys = [];
+
+    foreach ($posts as $post_id) {
+        $post_id = (int)$post_id;
+        $processed++;
+
+        $property_uid = trim((string)get_post_meta($post_id, '_hostfully_property_uid', true));
+        if ($property_uid === '') {
+            $skipped++;
+            continue;
+        }
+
+        $detail_status = 0;
+        $property = hostfully_mphb_fetch_property_detail($property_uid, $log, $detail_status);
+        if (empty($property) || !is_array($property)) {
+            if ($detail_status === 404) {
+                if (hostfully_mphb_mark_property_stale($post_id, $property_uid, $log, 'Fee sync')) {
+                    $skipped++;
+                } else {
+                    $errors++;
+                }
+            } else {
+                $errors++;
+            }
+            $log[] = 'Fee sync failed to fetch property detail for UID ' . $property_uid . '.';
+            continue;
+        }
+
+        $result = hostfully_mphb_sync_property_fees($post_id, $property, $log, $unknown_pricing_keys);
+        if (!empty($result['assigned']) || !empty($result['removed']) || !empty($result['prices'])) {
+            $updated++;
+        } else {
+            $skipped++;
+        }
+    }
+
+    if (!empty($unknown_pricing_keys)) {
+        ksort($unknown_pricing_keys);
+        $parts = [];
+        foreach ($unknown_pricing_keys as $pricing_key => $count) {
+            $parts[] = $pricing_key . ' (' . $count . ')';
+        }
+        $log[] = 'Additional Hostfully pricing keys seen (not synced): ' . implode(', ', $parts);
+    }
+
+    $log[] = 'Property fee sync batch: processed ' . $processed . ', updated ' . $updated . ', skipped ' . $skipped . ', errors ' . $errors . '.';
+
+    $next_offset = $offset + $processed;
+
+    return [
+        'processed' => $processed,
+        'offset' => $offset,
+        'next_offset' => $next_offset,
+        'total' => $total,
+        'done' => $next_offset >= $total,
+        'updated' => $updated,
+        'skipped' => $skipped,
+        'errors' => $errors,
+        'unknown_pricing_keys' => $unknown_pricing_keys,
+    ];
+}
+
 function hostfully_mphb_unpublish_missing_properties(array &$log): int
 {
     $hostfully = hostfully_mphb_get_properties_with_log($log);
@@ -3452,8 +3698,10 @@ function hostfully_mphb_render_admin()
 
                 <p>
                     <button id="hostfully-sync-amenities" class="button">Sync Amenities Catalog</button>
+                    <button id="hostfully-sync-property-fees" class="button" style="margin-left:8px;">Sync Property Fees</button>
                     <button id="hostfully-sync-guest-capacity" class="button" style="margin-left:8px;">Sync Guest Capacity</button>
                 </p>
+                <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Property Fees refreshes imported cleaning fee, security deposit, and extra guest fee data from Hostfully per property and reports additional pricing keys it finds.</p>
                 <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Guest Capacity updates imported accommodations to guests-only mode (`adults = guests`, `children = 0`) and aligns MotoPress capacity fields.</p>
             </div>
         </details>
@@ -4437,6 +4685,21 @@ add_action('wp_ajax_hostfully_mphb_sync_amenities', function () {
 
     $log = [];
     $res = hostfully_mphb_sync_amenities_catalog_safe($log);
+
+    wp_send_json_success([
+        'result' => $res,
+        'log'    => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_sync_property_fees', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $offset = isset($_POST['offset']) ? max(0, (int)$_POST['offset']) : 0;
+    $batch_size = isset($_POST['batch_size']) ? max(1, (int)$_POST['batch_size']) : 10;
+    $log = [];
+    $res = hostfully_mphb_sync_property_fees_for_imports($offset, $batch_size, $log);
 
     wp_send_json_success([
         'result' => $res,

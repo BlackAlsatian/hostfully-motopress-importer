@@ -1009,6 +1009,7 @@
 
 
   const syncAmenitiesBtn = document.getElementById('hostfully-sync-amenities');
+  const syncPropertyFeesBtn = document.getElementById('hostfully-sync-property-fees');
   const syncGuestCapacityBtn = document.getElementById('hostfully-sync-guest-capacity');
   if (syncAmenitiesBtn) {
     syncAmenitiesBtn.addEventListener('click', async function (e) {
@@ -1043,6 +1044,70 @@
       statusEl.textContent = `Amenities synced ✅ (processed: ${total})`;
       setBusy(false);
       syncAmenitiesBtn.disabled = false;
+    });
+  }
+
+  if (syncPropertyFeesBtn) {
+    syncPropertyFeesBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      wrap.style.display = 'block';
+      statusEl.textContent = 'Syncing property fees…';
+      appendLog(['—', 'Starting property fee sync…']);
+      setBusy(true);
+
+      syncPropertyFeesBtn.disabled = true;
+
+      const batchSize = 10;
+      let offset = 0;
+      let total = 0;
+      let updated = 0;
+      let skipped = 0;
+      let errors = 0;
+      let done = false;
+
+      while (!done) {
+        let r = null;
+        try {
+          r = await post('hostfully_mphb_sync_property_fees', {
+            offset: String(offset),
+            batch_size: String(batchSize),
+          });
+          if (r && r.success) markJsOk();
+        } catch (err) {
+          showError('Property fee sync failed', err);
+          syncPropertyFeesBtn.disabled = false;
+          return;
+        }
+        if (!r || !r.success) {
+          statusEl.textContent = 'Property fee sync error';
+          setBusy(false);
+          appendLog(['Property fee sync failed.', JSON.stringify(r)]);
+          syncPropertyFeesBtn.disabled = false;
+          return;
+        }
+
+        const d = r.data || {};
+        const result = d.result || {};
+        appendLog([...(d.log || [])]);
+
+        total = Number.isFinite(result.total) ? result.total : total;
+        updated += Number.isFinite(result.updated) ? result.updated : 0;
+        skipped += Number.isFinite(result.skipped) ? result.skipped : 0;
+        errors += Number.isFinite(result.errors) ? result.errors : 0;
+        offset = Number.isFinite(result.next_offset) ? result.next_offset : offset + batchSize;
+        done = !!result.done || (total > 0 && offset >= total);
+
+        if (statusEl) {
+          const checked = total > 0 ? Math.min(offset, total) : offset;
+          statusEl.textContent = `Syncing property fees… ${checked}${total ? ` / ${total}` : ''}`;
+        }
+
+        if (!done) await sleep(200);
+      }
+
+      statusEl.textContent = `Property fees synced ✅ (${updated} updated, ${skipped} skipped, ${errors} errors)`;
+      setBusy(false);
+      syncPropertyFeesBtn.disabled = false;
     });
   }
 
