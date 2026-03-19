@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer (Temporary)
  * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.37
+ * Version: 0.38
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -896,21 +896,68 @@ function hostfully_mphb_find_default_season_id(array &$log): int
     return (int)$chosen->ID;
 }
 
-function hostfully_mphb_build_season_price_payload(float $daily_rate, int $adults, int $children): array
+function hostfully_mphb_extract_extra_guest_fee(array $property): ?float
 {
+    $pricing = $property['pricing'] ?? [];
+    if (!is_array($pricing)) {
+        return null;
+    }
+
+    $amount = hostfully_mphb_extract_number($pricing['extraGuestFee'] ?? null);
+    if ($amount === null || $amount <= 0) {
+        return null;
+    }
+
+    return (float)$amount;
+}
+
+function hostfully_mphb_get_base_adults_for_pricing(int $room_type_id, array $property): int
+{
+    $guests = hostfully_mphb_extract_guest_counts($property);
+
+    $base_adults = (int)($guests['base'] ?? 0);
+    if ($base_adults < 1) {
+        $base_adults = (int)get_post_meta($room_type_id, '_hostfully_base_guests', true);
+    }
+    if ($base_adults < 1) {
+        $base_adults = (int)get_post_meta($room_type_id, 'mphb_base_adults_capacity', true);
+    }
+    if ($base_adults < 1) {
+        $base_adults = (int)get_post_meta($room_type_id, 'mphb_adults', true);
+    }
+
+    $max_adults = (int)($guests['max'] ?? 0);
+    if ($max_adults < 1) {
+        $max_adults = (int)get_post_meta($room_type_id, 'mphb_adults', true);
+    }
+
+    if ($max_adults > 0) {
+        $base_adults = min($base_adults, $max_adults);
+    }
+
+    return max(1, $base_adults);
+}
+
+function hostfully_mphb_build_season_price_payload(float $daily_rate, int $base_adults, int $children, ?float $extra_adult_price = null): array
+{
+    $extra_adult_prices = [''];
+    if ($extra_adult_price !== null && $extra_adult_price > 0) {
+        $extra_adult_prices = [(float)$extra_adult_price];
+    }
+
     return [
         'periods' => [1],
         'prices' => [(float)$daily_rate],
-        'base_adults' => $adults,
+        'base_adults' => $base_adults,
         'base_children' => $children,
-        'extra_adult_prices' => [''],
+        'extra_adult_prices' => $extra_adult_prices,
         'extra_child_prices' => [''],
         'enable_variations' => false,
         'variations' => [],
     ];
 }
 
-function hostfully_mphb_upsert_rate_season_price(int $rate_id, int $season_id, float $daily_rate, int $adults, int $children, array &$log): void
+function hostfully_mphb_upsert_rate_season_price(int $rate_id, int $season_id, float $daily_rate, int $base_adults, int $children, ?float $extra_adult_price, array &$log): void
 {
     if (!$rate_id || !$season_id) return;
 
@@ -926,7 +973,7 @@ function hostfully_mphb_upsert_rate_season_price(int $rate_id, int $season_id, f
         $season_prices = $existing;
     }
 
-    $payload = hostfully_mphb_build_season_price_payload($daily_rate, $adults, $children);
+    $payload = hostfully_mphb_build_season_price_payload($daily_rate, $base_adults, $children, $extra_adult_price);
     $season_key = (string)$season_id;
     $updated = false;
 
@@ -950,10 +997,74 @@ function hostfully_mphb_upsert_rate_season_price(int $rate_id, int $season_id, f
     }
 
     update_post_meta($rate_id, 'mphb_season_prices', $season_prices);
-    $log[] = 'Season price set for season ID ' . $season_id . ' (base price ' . $daily_rate . ').';
+    $log[] = 'Season price set for season ID ' . $season_id . ' (base price ' . $daily_rate . ', base guests ' . $base_adults . ', extra guest fee ' . ($extra_adult_price !== null ? $extra_adult_price : 'cleared') . ').';
 }
 
-function hostfully_mphb_upsert_rate(int $room_type_id, array $property, float $daily_rate, int $adults, int $children, array &$log, string $title_base = ''): int
+function hostfully_mphb_sync_native_extra_guest_pricing(int $room_type_id, array $property, array &$log): array
+{
+    $property_uid = trim((string)($property['uid'] ?? ''));
+    $extra_guest_fee = hostfully_mphb_extract_extra_guest_fee($property);
+
+    if ($extra_guest_fee !== null) {
+        update_post_meta($room_type_id, '_hostfully_extra_guest_fee', (string)$extra_guest_fee);
+    } else {
+        delete_post_meta($room_type_id, '_hostfully_extra_guest_fee');
+    }
+
+    if ($property_uid === '') {
+        return [
+            'synced' => false,
+            'rate_id' => 0,
+            'amount' => $extra_guest_fee,
+            'base_adults' => 0,
+        ];
+    }
+
+    $rate_id = hostfully_mphb_find_existing_rate_id($property_uid);
+    if ($rate_id < 1) {
+        if ($extra_guest_fee !== null) {
+            $log[] = 'Extra guest pricing pending: no imported rate found yet for UID ' . $property_uid . '.';
+        }
+
+        return [
+            'synced' => false,
+            'rate_id' => 0,
+            'amount' => $extra_guest_fee,
+            'base_adults' => 0,
+        ];
+    }
+
+    $daily_rate = hostfully_mphb_extract_number($property['pricing']['dailyRate'] ?? null);
+    if ($daily_rate === null || $daily_rate < 0) {
+        $daily_rate = hostfully_mphb_extract_number(get_post_meta($rate_id, 'mphb_price', true));
+    }
+    if ($daily_rate === null) {
+        $daily_rate = 0.0;
+    }
+
+    $base_adults = hostfully_mphb_get_base_adults_for_pricing($room_type_id, $property);
+    $season_id = hostfully_mphb_find_default_season_id($log);
+    if ($season_id > 0) {
+        hostfully_mphb_upsert_rate_season_price($rate_id, $season_id, (float)$daily_rate, $base_adults, 0, $extra_guest_fee, $log);
+    }
+
+    if ($extra_guest_fee !== null) {
+        update_post_meta($rate_id, '_hostfully_extra_guest_fee', (string)$extra_guest_fee);
+        $log[] = 'Extra guest pricing synced to native rate pricing: rate ' . $rate_id . ', amount ' . $extra_guest_fee . ', base guests ' . $base_adults . '.';
+    } else {
+        delete_post_meta($rate_id, '_hostfully_extra_guest_fee');
+        $log[] = 'Extra guest pricing cleared from native rate pricing: rate ' . $rate_id . '.';
+    }
+
+    return [
+        'synced' => true,
+        'rate_id' => $rate_id,
+        'amount' => $extra_guest_fee,
+        'base_adults' => $base_adults,
+    ];
+}
+
+function hostfully_mphb_upsert_rate(int $room_type_id, array $property, float $daily_rate, int $base_adults, int $children, ?float $extra_adult_price, array &$log, string $title_base = ''): int
 {
     $property_uid = (string)($property['uid'] ?? '');
     if (!$property_uid) return 0;
@@ -1001,7 +1112,13 @@ function hostfully_mphb_upsert_rate(int $room_type_id, array $property, float $d
     // Ensure a season price row exists so the UI shows the base price.
     $season_id = hostfully_mphb_find_default_season_id($log);
     if ($season_id) {
-        hostfully_mphb_upsert_rate_season_price($rate_id, $season_id, $daily_rate, $adults, $children, $log);
+        hostfully_mphb_upsert_rate_season_price($rate_id, $season_id, $daily_rate, $base_adults, $children, $extra_adult_price, $log);
+    }
+
+    if ($extra_adult_price !== null) {
+        update_post_meta($rate_id, '_hostfully_extra_guest_fee', (string)$extra_adult_price);
+    } else {
+        delete_post_meta($rate_id, '_hostfully_extra_guest_fee');
     }
 
     return $rate_id;
@@ -2656,11 +2773,15 @@ function hostfully_mphb_fee_specs(): array
             'periodicity' => 'once',
             'price_quantity' => 'once',
         ],
-        'extraGuestFee' => [
-            'title' => 'Extra Guest Fee',
-            'periodicity' => 'once',
-            'price_quantity' => 'once',
-        ],
+    ];
+}
+
+function hostfully_mphb_known_imported_fee_keys(): array
+{
+    return [
+        'cleaningFee',
+        'securityDeposit',
+        'extraGuestFee',
     ];
 }
 
@@ -2687,7 +2808,22 @@ function hostfully_mphb_is_imported_fee_service(int $service_id): bool
 
     if (strpos($service_key, 'fee:') === 0) return true;
 
-    return in_array($service_key, array_keys(hostfully_mphb_fee_specs()), true);
+    return in_array($service_key, hostfully_mphb_known_imported_fee_keys(), true);
+}
+
+function hostfully_mphb_is_legacy_extra_guest_service(int $service_id): bool
+{
+    if ($service_id < 1) return false;
+
+    $fee_type = get_post_meta($service_id, '_hostfully_fee_type', true);
+    if ($fee_type === 'extraGuestFee') return true;
+
+    $service_key = get_post_meta($service_id, '_hostfully_service_key', true);
+    if (!is_string($service_key) || $service_key === '') return false;
+
+    if ($service_key === 'extraGuestFee') return true;
+
+    return (bool)preg_match('/^fee:[^:]+:extraGuestFee$/', $service_key);
 }
 
 function hostfully_mphb_sync_property_fees(int $room_type_id, array $property, array &$log, array &$unknown_pricing_keys = []): array
@@ -2712,6 +2848,7 @@ function hostfully_mphb_sync_property_fees(int $room_type_id, array $property, a
     $fee_specs = hostfully_mphb_fee_specs();
     $prices = [];
     $new_fee_service_ids = [];
+    $deleted_legacy_extra_guest_services = 0;
 
     foreach ($fee_specs as $fee_key => $spec) {
         $value = $pricing[$fee_key] ?? null;
@@ -2746,9 +2883,13 @@ function hostfully_mphb_sync_property_fees(int $room_type_id, array $property, a
 
     $kept_service_ids = [];
     $removed = 0;
+    $legacy_extra_guest_service_ids = [];
     foreach (hostfully_mphb_get_room_type_service_ids($room_type_id) as $service_id) {
         if (hostfully_mphb_is_imported_fee_service($service_id)) {
             $removed++;
+            if (hostfully_mphb_is_legacy_extra_guest_service($service_id)) {
+                $legacy_extra_guest_service_ids[] = $service_id;
+            }
             continue;
         }
         $kept_service_ids[] = $service_id;
@@ -2756,6 +2897,14 @@ function hostfully_mphb_sync_property_fees(int $room_type_id, array $property, a
 
     $final_service_ids = array_merge($kept_service_ids, array_values(array_filter(array_map('intval', $new_fee_service_ids))));
     hostfully_mphb_store_room_type_service_ids($room_type_id, $final_service_ids, $log, 'Fee services synced (mphb_services): ');
+
+    foreach (array_values(array_unique(array_filter(array_map('intval', $legacy_extra_guest_service_ids)))) as $service_id) {
+        wp_delete_post($service_id, true);
+        $deleted_legacy_extra_guest_services++;
+        $log[] = 'Deleted legacy extra guest fee service: ' . $service_id . '.';
+    }
+
+    $extra_guest_result = hostfully_mphb_sync_native_extra_guest_pricing($room_type_id, $property, $log);
 
     foreach ($pricing as $pricing_key => $_value) {
         if (!is_string($pricing_key) || in_array($pricing_key, hostfully_mphb_known_pricing_keys(), true)) continue;
@@ -2769,6 +2918,8 @@ function hostfully_mphb_sync_property_fees(int $room_type_id, array $property, a
             $parts[] = $fee_key . '=' . $amount;
         }
         $log[] = 'Fee sync: ' . implode(' | ', $parts);
+    } elseif (($extra_guest_result['amount'] ?? null) !== null || !empty($extra_guest_result['synced'])) {
+        $log[] = 'Fee sync: no cleaning/security service values found.';
     } else {
         $log[] = 'Fee sync: no known Hostfully fee values found.';
     }
@@ -2776,6 +2927,9 @@ function hostfully_mphb_sync_property_fees(int $room_type_id, array $property, a
     return [
         'assigned' => count(array_filter(array_map('intval', $new_fee_service_ids))),
         'removed' => $removed,
+        'deleted_legacy_extra_guest_services' => $deleted_legacy_extra_guest_services,
+        'extra_guest_rate_synced' => !empty($extra_guest_result['synced']),
+        'extra_guest_fee' => $extra_guest_result['amount'] ?? null,
         'prices' => $prices,
     ];
 }
@@ -2870,6 +3024,11 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     $children = 0;
 
     $daily_rate  = $property['pricing']['dailyRate'] ?? 0;
+    $base_rate_adults = $base_guests ?? $adults;
+    $base_rate_adults = (int)$base_rate_adults;
+    if ($base_rate_adults < 1) $base_rate_adults = $adults;
+    if ($base_rate_adults > $adults) $base_rate_adults = $adults;
+    $extra_guest_fee = hostfully_mphb_extract_extra_guest_fee($property);
 
     update_post_meta($post_id, 'mphb_adults', $adults);
     update_post_meta($post_id, 'mphb_children', $children);
@@ -3082,7 +3241,7 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     }
 
     // 9) Rate + at least one unit (bookable)
-    $rate_id = hostfully_mphb_upsert_rate((int)$post_id, $property, (float)$daily_rate, (int)$adults, (int)$children, $log, $title);
+    $rate_id = hostfully_mphb_upsert_rate((int)$post_id, $property, (float)$daily_rate, (int)$base_rate_adults, (int)$children, $extra_guest_fee, $log, $title);
     if ($rate_id) {
         $log[] = 'Rate linked OK: ' . $rate_id;
     } else {
@@ -3512,7 +3671,7 @@ function hostfully_mphb_sync_property_fees_for_imports(int $offset, int $batch_s
         }
 
         $result = hostfully_mphb_sync_property_fees($post_id, $property, $log, $unknown_pricing_keys);
-        if (!empty($result['assigned']) || !empty($result['removed']) || !empty($result['prices'])) {
+        if (!empty($result['assigned']) || !empty($result['removed']) || !empty($result['deleted_legacy_extra_guest_services']) || !empty($result['prices']) || !empty($result['extra_guest_rate_synced'])) {
             $updated++;
         } else {
             $skipped++;
@@ -3701,7 +3860,7 @@ function hostfully_mphb_render_admin()
                     <button id="hostfully-sync-property-fees" class="button" style="margin-left:8px;">Sync Property Fees</button>
                     <button id="hostfully-sync-guest-capacity" class="button" style="margin-left:8px;">Sync Guest Capacity</button>
                 </p>
-                <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Property Fees refreshes imported cleaning fee, security deposit, and extra guest fee data from Hostfully per property and reports additional pricing keys it finds.</p>
+                <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Property Fees refreshes cleaning fee and security deposit services per property, syncs extra guest fee into native MotoPress rate pricing, and reports additional pricing keys it finds.</p>
                 <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Guest Capacity updates imported accommodations to guests-only mode (`adults = guests`, `children = 0`) and aligns MotoPress capacity fields.</p>
             </div>
         </details>
