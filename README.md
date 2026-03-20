@@ -14,12 +14,13 @@ This plugin pulls Hostfully properties into MotoPress Hotel Booking (WordPress) 
 - Downloads featured images and gallery photos with a configurable limit.
 - Ensures an “All Year” season exists and writes season prices so rates display in the UI.
 - Bulk import via AJAX with progress logging, verbose mode, and summary.
+- One-click post-import sync to run fee sync and guest-capacity sync in the correct order.
 - Single import for testing with the same log panel and spinner.
 - Import by UID list when the Hostfully property list endpoint is incomplete.
 - Compare pasted UIDs to already-imported ones and isolate missing entries.
 - iCal audit report to compare channel links vs available iCal feeds.
 - Link Hostfully iCal feeds into MotoPress external calendars (with safe skip/overwrite option).
-- Dry-run location normalization audit to preview city/province term changes before import writes.
+- Fee sync drafts stale imported properties when Hostfully property detail fetches return 404.
 
 ## Requirements
 - WordPress 6.x
@@ -43,13 +44,14 @@ Go to **Hostfully Import** in WP Admin and set:
 
 ## Usage
 1. **Save Settings** after entering API Key and Agency UID.
-2. **Sync Amenities Catalog** once (recommended).
-3. **Import One** to verify configuration and output.
-4. **Bulk Import** to process all remaining properties.
-5. **Import by UID List** when Hostfully’s property list is incomplete. Use “Compare & Show Missing” to find what’s not yet imported.
-6. **iCal Links Audit** to see which properties have channel links but no iCal feeds.
-7. **Link iCal Feeds** to write Hostfully iCal URLs into MotoPress external calendars (skips rooms that already have calendars unless overwrite is checked).
-8. **Location Normalization Audit (Dry Run)** to preview location changes (e.g., `WC` → `Western Cape`, `Port Elizabeth` → `Gqeberha`) with no writes.
+2. **Bulk Import / Update** for the main import job.
+3. Enable **Update existing imports too** when you want to refresh properties that are already imported.
+4. Run **Post-Import Sync** after a bulk refresh. This updates property fees, native extra guest pricing, guest-capacity fields, and drafts stale properties when Hostfully returns 404 for property detail fetches.
+5. Use **Sync Amenities Catalog** only when Hostfully amenities have changed or amenity mapping needs to be refreshed.
+6. Use **Import One** to validate one property before running a full bulk job.
+7. Use **Import by UID List** only when Hostfully’s property list is incomplete. Use “Compare & Show Missing” to isolate missing UIDs.
+8. Use **iCal Links Audit** to see which properties have channel links but no iCal feeds.
+9. Use **Link iCal Feeds** to write Hostfully iCal URLs into MotoPress external calendars (skips rooms that already have calendars unless overwrite is checked).
 
 ## Meta Fields Added
 These meta keys are stored on the Accommodation Type (mphb_room_type) and can be used in Elementor or custom templates.
@@ -97,6 +99,7 @@ MotoPress rates use **season prices** to display in the UI. If no seasons exist,
 
 ## Notes
 - Import is **idempotent**: re-running will update existing items unless you choose otherwise.
+- The normal operator flow is: **Bulk Import / Update**, then **Post-Import Sync**.
 - iCal sync is not required for importing properties and rates.
 - Availability sync can be handled separately via MotoPress + external iCal setup.
 - If Hostfully’s `/properties` list does not return all properties, use the **Import by UID List** tool to fill the gaps.

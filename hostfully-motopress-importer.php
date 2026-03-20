@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer (Temporary)
  * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.38
+ * Version: 0.39
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -3787,62 +3787,74 @@ function hostfully_mphb_render_admin()
             </div>
         <?php endif; ?>
 
+        <div class="notice notice-info inline" style="max-width:960px; margin:16px 0 0;">
+            <p><strong>Recommended routine:</strong> save settings once, run Bulk Import / Update for normal refreshes, then run Post-Import Sync once. Everything else below is for testing, recovery, recovery after partial runs, or one-off maintenance.</p>
+            <p style="margin-top:6px;"><strong>Quick start for a new user:</strong> 1) confirm the API settings, 2) use Bulk Import / Update to create or refresh properties, 3) run Post-Import Sync so fees, extra guest pricing, guest-capacity fields, and stale-property drafting are all brought up to date.</p>
+        </div>
+
         <hr>
 
         <details id="hostfully-step-settings" data-step="hostfully-step-settings">
             <summary><strong>Step 1: API Settings</strong></summary>
             <div style="margin-top:8px;">
+                <p style="max-width:900px; margin-top:0;">These settings normally change only when the Hostfully account, API credentials, or import strategy changes. If you are unsure, leave everything except the API key and agency UID as-is.</p>
                 <form method="post">
                     <?php wp_nonce_field('hostfully_mphb_settings'); ?>
                     <table class="form-table" role="presentation">
                         <tr>
                             <th scope="row"><label for="hostfully_api_key">API Key</label></th>
-                            <td><input id="hostfully_api_key" type="text" name="hostfully[api_key]" value="<?= esc_attr($cfg['api_key']); ?>" style="width:420px;"></td>
+                            <td><input id="hostfully_api_key" type="text" name="hostfully[api_key]" value="<?= esc_attr($cfg['api_key']); ?>" style="width:420px;" title="Paste the Hostfully API key used to read properties, pricing, amenities, and related data."></td>
                         </tr>
                         <tr>
                             <th scope="row"><label for="hostfully_agency_uid">Agency UID</label></th>
-                            <td><input id="hostfully_agency_uid" type="text" name="hostfully[agency_uid]" value="<?= esc_attr($cfg['agency_uid']); ?>" style="width:420px;"></td>
+                            <td><input id="hostfully_agency_uid" type="text" name="hostfully[agency_uid]" value="<?= esc_attr($cfg['agency_uid']); ?>" style="width:420px;" title="Enter the Hostfully agency UID whose properties should be imported into MotoPress."></td>
                         </tr>
                         <tr>
                             <th scope="row"><label for="hostfully_max_photos">Max photos per property</label></th>
-                            <td><input id="hostfully_max_photos" type="number" min="0" name="hostfully[max_photos]" value="<?= esc_attr($cfg['max_photos']); ?>" style="width:120px;"></td>
+                            <td>
+                                <input id="hostfully_max_photos" type="number" min="0" name="hostfully[max_photos]" value="<?= esc_attr($cfg['max_photos']); ?>" style="width:120px;" title="Limits how many Hostfully images are imported per property. Lower this only if media volume is too high.">
+                                <p class="description" style="margin:6px 0 0;">Use this to control media volume. Most users can leave it unchanged.</p>
+                            </td>
                         </tr>
                         <tr>
                             <th scope="row"><label for="hostfully_bulk_limit">Bulk import limit</label></th>
-                            <td><input id="hostfully_bulk_limit" type="number" min="1" name="hostfully[bulk_limit]" value="<?= esc_attr($cfg['bulk_limit']); ?>" style="width:120px;"></td>
+                            <td>
+                                <input id="hostfully_bulk_limit" type="number" min="1" name="hostfully[bulk_limit]" value="<?= esc_attr($cfg['bulk_limit']); ?>" style="width:120px;" title="Sets how many properties the bulk queue prepares per run. Increase it for bigger refreshes if the site handles it comfortably.">
+                                <p class="description" style="margin:6px 0 0;">Controls how many properties each bulk run will queue. Increase cautiously on slower hosting.</p>
+                            </td>
                         </tr>
                         <tr>
                             <th scope="row">Include inactive properties</th>
                             <td>
                                 <label>
-                                    <input type="checkbox" name="hostfully[include_inactive_properties]" value="1" <?= !empty($cfg['include_inactive_properties']) ? 'checked' : ''; ?>>
+                                    <input type="checkbox" name="hostfully[include_inactive_properties]" value="1" <?= !empty($cfg['include_inactive_properties']) ? 'checked' : ''; ?> title="Include inactive or archived Hostfully properties in list fetches. Only enable this when you intentionally want those records included.">
                                     Include inactive/archived properties when fetching from Hostfully
                                 </label>
+                                <p class="description" style="margin:6px 0 0;">Usually leave this off. Turn it on only if you deliberately need inactive records in the import source list.</p>
                             </td>
                         </tr>
                         <tr>
                             <th scope="row">API enrichment</th>
                             <td>
                                 <label style="display:block; margin:4px 0 6px;">
-                                    <input type="checkbox" name="hostfully[allow_enrich_api]" value="1" <?= !empty($cfg['allow_enrich_api']) ? 'checked' : ''; ?>>
+                                    <input type="checkbox" name="hostfully[allow_enrich_api]" value="1" <?= !empty($cfg['allow_enrich_api']) ? 'checked' : ''; ?> title="Allow extra Hostfully API requests to fill gaps when the main property payload is missing data.">
                                     Allow extra Hostfully API calls to enrich missing data (cached). Disable this if you’re worried about rate limits.
                                 </label>
                                 <label style="display:block; margin:4px 0 0;">
                                     Amenities cache hours:
-                                    <input type="number" min="1" max="168" name="hostfully[amenities_cache_hours]" value="<?= esc_attr($cfg['amenities_cache_hours'] ?? 24); ?>" style="width:120px;">
+                                    <input type="number" min="1" max="168" name="hostfully[amenities_cache_hours]" value="<?= esc_attr($cfg['amenities_cache_hours'] ?? 24); ?>" style="width:120px;" title="How long the importer should reuse cached Hostfully amenities data before refreshing it.">
                                 </label>
                                 <label style="display:block; margin:8px 0 0;">
-                                    <input type="checkbox" name="hostfully[verbose_log]" value="1" <?= !empty($cfg['verbose_log']) ? 'checked' : ''; ?>>
+                                    <input type="checkbox" name="hostfully[verbose_log]" value="1" <?= !empty($cfg['verbose_log']) ? 'checked' : ''; ?> title="Adds detailed technical steps to logs. Useful for troubleshooting, but noisier for routine use.">
                                     Enable verbose logging (adds detailed steps to the import log).
                                 </label>
-                                <p class="description" style="margin-top:8px;">Amenities cache hours controls how long we reuse Hostfully data before refreshing.</p>
+                                <p class="description" style="margin-top:8px;">Enable enrichment only when missing data is a real problem. Enable verbose logging mainly when debugging a sync issue.</p>
                             </td>
                         </tr>
-
                     </table>
 
                     <p>
-                        <button class="button button-primary" name="hostfully_save_settings" value="1">Save Settings</button>
+                        <button class="button button-primary" name="hostfully_save_settings" value="1" title="Save the importer configuration shown above.">Save Settings</button>
                     </p>
                 </form>
             </div>
@@ -3850,69 +3862,51 @@ function hostfully_mphb_render_admin()
 
         <hr>
 
-        <details id="hostfully-step-sync" data-step="hostfully-step-sync">
-            <summary><strong>Step 2: Catalog Sync (Recommended)</strong></summary>
-            <div style="margin-top:8px;">
-                <p>Sync global lists (like amenities) once to reduce per-property API calls and keep mappings stable.</p>
+        <details id="hostfully-step-workflow" data-step="hostfully-step-workflow">
+            <summary><strong>Step 2: Recommended Workflow</strong></summary>
+            <div style="margin-top:8px; max-width:960px;">
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <strong>For a normal refresh:</strong>
+                    <ol style="margin:8px 0 0 18px;">
+                        <li>Run <strong>Bulk Import / Update</strong> with <strong>Update existing imports too</strong> enabled if you want to refresh existing properties.</li>
+                        <li>Run <strong>Post-Import Sync</strong> once to refresh property fees, extra guest pricing, guest-capacity fields, and stale-property drafting.</li>
+                    </ol>
+                    <p class="description" style="margin:8px 0 0;">If you only remember one rule: bulk import first, post-import sync second.</p>
+                </div>
 
-                <p>
-                    <button id="hostfully-sync-amenities" class="button">Sync Amenities Catalog</button>
-                    <button id="hostfully-sync-property-fees" class="button" style="margin-left:8px;">Sync Property Fees</button>
-                    <button id="hostfully-sync-guest-capacity" class="button" style="margin-left:8px;">Sync Guest Capacity</button>
-                </p>
-                <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Property Fees refreshes cleaning fee and security deposit services per property, syncs extra guest fee into native MotoPress rate pricing, and reports additional pricing keys it finds.</p>
-                <p class="description" style="margin:6px 0 0; max-width:900px;">Sync Guest Capacity updates imported accommodations to guests-only mode (`adults = guests`, `children = 0`) and aligns MotoPress capacity fields.</p>
-            </div>
-        </details>
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <h2 style="margin:0 0 8px; font-size:16px;">Optional Prep</h2>
+                    <p style="margin-top:0;">Sync the amenities catalog only when Hostfully has added or renamed amenities and you want the importer’s reference data refreshed.</p>
+                    <p style="margin-bottom:0;">
+                        <button id="hostfully-sync-amenities" class="button" title="Refresh the importer's internal amenities catalog from Hostfully. Use this when Hostfully amenities have changed or when troubleshooting amenity mapping.">Sync Amenities Catalog</button>
+                    </p>
+                    <p class="description" style="margin:8px 0 0;">Do not run this on every import unless there is a reason. It is a reference-data refresh, not a required daily step.</p>
+                </div>
 
-        <hr>
-
-        <details id="hostfully-step-one" data-step="hostfully-step-one">
-            <summary><strong>Step 3: Import One (Test)</strong></summary>
-            <div style="margin-top:8px;">
-                <form method="post" id="hostfully-import-one-form">
-                    <?php wp_nonce_field('hostfully_mphb_import_one'); ?>
-
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <h2 style="margin:0 0 8px; font-size:16px;">Bulk Import / Update</h2>
+                    <p style="margin-top:0;">Imports properties one at a time via AJAX so the page doesn’t time out. This is the main button to use for first imports and normal update passes.</p>
                     <p>
-                        <label>Select Hostfully Property</label><br>
-                        <label style="display:block; margin:6px 0 8px;">
-                            <input type="checkbox" name="update_existing" value="1"> Allow updating an already-imported property
+                        <label style="margin-right:12px;">
+                            <input type="checkbox" id="hostfully-bulk-update-existing" value="1" title="Re-import properties that already exist in MotoPress. Enable this for refreshes; leave it off for first-time-only imports."> Update existing imports too
                         </label>
-                        <select name="property_uid" id="hostfully-property-select" style="width:420px;">
-                            <option value="">-- Load properties to select --</option>
-                        </select>
-                        <button id="hostfully-load-properties" class="button" style="margin-left:6px;">Load properties</button>
-                        <button id="hostfully-refresh-properties" class="button" style="margin-left:6px;">Refresh</button>
-                        <span id="hostfully-load-properties-status" style="margin-left:6px; color:#666;"></span>
-                        <span id="hostfully-load-properties-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                        <label style="margin-right:12px;">
+                            <input type="checkbox" id="hostfully-bulk-update-slugs" value="1" title="Update WordPress slugs for imported room types, rates, and rooms to match current titles. Use carefully if URLs have already gone live."> Update slugs to match titles
+                        </label>
+                        <button id="hostfully-bulk-start" class="button button-primary" title="Start the bulk queue using the options selected above.">Start Bulk Import / Update</button>
+                        <button id="hostfully-bulk-stop" class="button" disabled title="Stop after the current property finishes processing.">Stop</button>
                     </p>
+                    <p class="description" style="margin:8px 0 0;">Typical use: first import = leave “Update existing imports too” off. Refresh import = turn it on.</p>
+                </div>
 
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <h2 style="margin:0 0 8px; font-size:16px;">Post-Import Sync</h2>
+                    <p style="margin-top:0;">Runs the two maintenance steps that should normally follow a bulk refresh: property fee sync and guest capacity sync.</p>
                     <p>
-                        <button class="button button-primary" name="hostfully_import_one" value="1">Import Selected</button>
-                        <span id="hostfully-import-one-status" style="margin-left:10px; color:#666;"></span>
-                        <span id="hostfully-import-one-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                        <button id="hostfully-post-import-sync" class="button button-secondary" title="Run property fee sync and guest capacity sync in sequence. This is the normal follow-up after a bulk import or refresh.">Run Post-Import Sync</button>
                     </p>
-                </form>
-            </div>
-        </details>
-
-        <hr>
-
-        <details id="hostfully-step-bulk" data-step="hostfully-step-bulk">
-            <summary><strong>Step 4: Bulk Import</strong></summary>
-            <div style="margin-top:8px;">
-                <p>This will import properties that are not yet imported (up to your bulk limit), one at a time via AJAX so the page doesn’t time out.</p>
-
-                <p>
-                    <label style="margin-right:12px;">
-                        <input type="checkbox" id="hostfully-bulk-update-existing" value="1"> Update existing imports too
-                    </label>
-                    <label style="margin-right:12px;">
-                        <input type="checkbox" id="hostfully-bulk-update-slugs" value="1"> Update slugs to match titles
-                    </label>
-                    <button id="hostfully-bulk-start" class="button button-primary">Start Bulk Import</button>
-                    <button id="hostfully-bulk-stop" class="button" disabled>Stop</button>
-                </p>
+                    <p class="description" style="margin:0; max-width:900px;">This refreshes cleaning fee and security deposit services per property, syncs extra guest fee into MotoPress native rate pricing, aligns imported accommodations to guests-only capacity fields, and drafts stale properties when Hostfully property detail fetches return 404.</p>
+                </div>
 
                 <div id="hostfully-progress" style="display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;">
                     <strong>Status:</strong> <span id="hostfully-status">Idle</span>
@@ -3926,97 +3920,107 @@ function hostfully_mphb_render_admin()
 
         <hr>
 
-        <details id="hostfully-step-migrate" data-step="hostfully-step-migrate">
-            <summary><strong>Step 5: Migration & Cleanup</strong></summary>
-            <div style="margin-top:8px;">
-                <p>Runs through already-imported properties and updates them to apply the latest mapping rules (e.g., new attributes).</p>
-                <p>
-                    <button id="hostfully-migrate-start" class="button">Start Migration Pass</button>
-                    <button id="hostfully-cleanup-terms" class="button">Cleanup Unused Terms</button>
-                </p>
-                <label style="display:block; margin:-4px 0 10px;">
-                    <input type="checkbox" id="hostfully-migrate-update-slugs" value="1">
-                    Update slugs to match the new titles (accommodation type, rate, unit)
-                </label>
-                <p class="description" style="margin:8px 0 0; max-width:900px;">
-                    Cleanup now runs a default maintenance pass (unused terms + orphan rates/rooms/services/media + attribute registry cleanup).
-                </p>
-            </div>
-        </details>
+        <details id="hostfully-step-advanced" data-step="hostfully-step-advanced">
+            <summary><strong>Advanced Tools</strong></summary>
+            <div style="margin-top:8px; max-width:960px;">
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <h2 style="margin:0 0 8px; font-size:16px;">Import One (Test)</h2>
+                    <p style="margin-top:0;">Use this when validating the importer against a single property before running a full bulk job.</p>
+                    <form method="post" id="hostfully-import-one-form">
+                        <?php wp_nonce_field('hostfully_mphb_import_one'); ?>
+                        <p>
+                            <label>Select Hostfully Property</label><br>
+                            <label style="display:block; margin:6px 0 8px;">
+                                <input type="checkbox" name="update_existing" value="1" title="Permit this single-property import to update an existing imported property instead of blocking it."> Allow updating an already-imported property
+                            </label>
+                            <select name="property_uid" id="hostfully-property-select" style="width:420px; max-width:100%;">
+                                <option value="">-- Load properties to select --</option>
+                            </select>
+                            <button id="hostfully-load-properties" class="button" style="margin-left:6px;" title="Load the current Hostfully property list into the dropdown.">Load properties</button>
+                            <button id="hostfully-refresh-properties" class="button" style="margin-left:6px;" title="Clear the cached Hostfully property list and fetch it again.">Refresh</button>
+                            <span id="hostfully-load-properties-status" style="margin-left:6px; color:#666;"></span>
+                            <span id="hostfully-load-properties-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                        </p>
+                        <p style="margin-bottom:0;">
+                            <button class="button button-primary" name="hostfully_import_one" value="1" title="Import or update only the selected property.">Import Selected</button>
+                            <span id="hostfully-import-one-status" style="margin-left:10px; color:#666;"></span>
+                            <span id="hostfully-import-one-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                        </p>
+                    </form>
+                </div>
 
-        <hr>
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <h2 style="margin:0 0 8px; font-size:16px;">Import by UID List</h2>
+                    <p style="margin-top:0;">Use this only when Hostfully’s property listing API is incomplete and you need to target specific properties.</p>
+                    <form id="hostfully-uid-import-form">
+                        <?php wp_nonce_field('hostfully_mphb_import_uids'); ?>
+                        <p>
+                            <label for="hostfully_uid_list"><strong>Property UIDs (one per line or CSV)</strong></label><br>
+                            <textarea id="hostfully_uid_list" name="uids_raw" rows="5" style="width:620px; max-width:100%;"></textarea>
+                        </p>
+                        <p>
+                            <button class="button" id="hostfully-uid-compare" title="Compare the pasted UID list against already-imported properties and show which ones are still missing.">Compare & Show Missing</button>
+                            <span style="margin-left:6px; color:#666;">Compares pasted UIDs vs already-imported ones.</span>
+                        </p>
+                        <p>
+                            <label for="hostfully_uid_missing"><strong>Missing UIDs (not imported yet)</strong></label><br>
+                            <textarea id="hostfully_uid_missing" rows="5" style="width:620px; max-width:100%;" readonly></textarea>
+                        </p>
+                        <p>
+                            <button class="button" id="hostfully-uid-use-missing" title="Replace the main UID list with only the missing UIDs found by the compare step.">Use Missing as Import List</button>
+                        </p>
+                        <p>
+                            <label>
+                                <input type="checkbox" id="hostfully-uid-update-existing" value="1" title="Allow the UID list import to update existing imported properties as well as missing ones."> Update existing imports too
+                            </label>
+                        </p>
+                        <p style="margin-bottom:0;">
+                            <button class="button button-primary" id="hostfully-uid-start" title="Queue imports for the UIDs pasted above.">Import UIDs</button>
+                        </p>
+                        <p class="description" style="margin:8px 0 0;">Best used for exceptions, not routine imports.</p>
+                    </form>
+                </div>
 
-        <details id="hostfully-step-uid" data-step="hostfully-step-uid">
-            <summary><strong>Step 6: Import by UID List (When API Listing Is Incomplete)</strong></summary>
-            <div style="margin-top:8px;">
-                <p>If Hostfully’s property list doesn’t return everything, paste a list of property UIDs below (from a Hostfully export or UI copy). We’ll import only those UIDs.</p>
-                <form id="hostfully-uid-import-form">
-                    <?php wp_nonce_field('hostfully_mphb_import_uids'); ?>
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <h2 style="margin:0 0 8px; font-size:16px;">Maintenance</h2>
+                    <p style="margin-top:0;">Individual maintenance actions are still available here when you need a one-off rerun without doing the whole post-import sequence.</p>
                     <p>
-                        <label for="hostfully_uid_list"><strong>Property UIDs (one per line or CSV)</strong></label><br>
-                        <textarea id="hostfully_uid_list" name="uids_raw" rows="5" style="width:620px; max-width:100%;"></textarea>
+                        <button id="hostfully-sync-property-fees" class="button" title="Refresh per-property cleaning fees, security deposits, native extra guest pricing, and stale-property drafting without running a full post-import sync.">Sync Property Fees</button>
+                        <button id="hostfully-sync-guest-capacity" class="button" style="margin-left:8px;" title="Reapply guests-only capacity values to imported accommodations without touching pricing or fees.">Sync Guest Capacity</button>
+                        <button id="hostfully-cleanup-terms" class="button" style="margin-left:8px;" title="Remove unused taxonomy terms and delete orphaned importer artifacts such as rates, rooms, services, media, and stale attribute-registry entries.">Run Cleanup</button>
                     </p>
-                    <p>
-                        <button class="button" id="hostfully-uid-compare">Compare & Show Missing</button>
-                        <span style="margin-left:6px; color:#666;">Compares pasted UIDs vs already-imported ones.</span>
-                    </p>
-                    <p>
-                        <label for="hostfully_uid_missing"><strong>Missing UIDs (not imported yet)</strong></label><br>
-                        <textarea id="hostfully_uid_missing" rows="5" style="width:620px; max-width:100%;" readonly></textarea>
-                    </p>
-                    <p>
-                        <button class="button" id="hostfully-uid-use-missing">Use Missing as Import List</button>
-                    </p>
-                    <p>
-                        <label>
-                            <input type="checkbox" id="hostfully-uid-update-existing" value="1"> Update existing imports too
-                        </label>
-                    </p>
-                    <p>
-                        <button class="button button-primary" id="hostfully-uid-start">Import UIDs</button>
-                    </p>
-                </form>
-            </div>
-        </details>
+                    <p class="description" style="margin:6px 0 0; max-width:900px;">Use these only when you need one specific maintenance action. For routine operations, prefer the main Post-Import Sync. Cleanup is best reserved for housekeeping after significant import changes or removals.</p>
+                </div>
 
-        <hr>
-
-        <details id="hostfully-step-ical" data-step="hostfully-step-ical">
-            <summary><strong>Step 7: iCal Links Audit (Channel Links vs Feeds)</strong></summary>
-            <div style="margin-top:8px;">
-                <p>Checks which properties have channel links (Airbnb/Booking) and whether Hostfully returns any iCal feeds for them.</p>
-                <p>
-                    <label for="hostfully-ical-report-limit" style="margin-right:8px;">Max properties to scan</label>
-                    <input id="hostfully-ical-report-limit" type="number" min="1" max="200" value="50" style="width:120px;">
-                    <button id="hostfully-ical-report-run" class="button" style="margin-left:8px;">Run iCal Audit</button>
-                    <button id="hostfully-ical-report-csv" class="button" style="margin-left:6px;">Download Needs Setup CSV</button>
-                    <span id="hostfully-ical-report-status" style="margin-left:8px; color:#666;"></span>
-                    <span id="hostfully-ical-report-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
-                </p>
-                <div id="hostfully-ical-report-table" style="margin-top:10px;"></div>
-                <pre id="hostfully-ical-report-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
-            </div>
-        </details>
-
-        <hr>
-
-        <details id="hostfully-step-ical-link" data-step="hostfully-step-ical-link">
-            <summary><strong>Step 8: Link Hostfully iCal Feeds into MotoPress</strong></summary>
-            <div style="margin-top:8px;">
-                <p>Looks up Hostfully iCal feeds and writes them to MotoPress external calendars for the matching accommodation unit.</p>
-                <p>
-                    <label for="hostfully-ical-link-limit" style="margin-right:8px;">Max properties to scan</label>
-                    <input id="hostfully-ical-link-limit" type="number" min="1" max="200" value="50" style="width:120px;">
-                    <button id="hostfully-ical-link-run" class="button" style="margin-left:8px;">Link iCal Feeds</button>
-                    <span id="hostfully-ical-link-status" style="margin-left:8px; color:#666;"></span>
-                    <span id="hostfully-ical-link-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
-                </p>
-                <label style="display:block; margin:-4px 0 10px;">
-                    <input type="checkbox" id="hostfully-ical-link-replace" value="1">
-                    Replace existing external calendars (overwrite)
-                </label>
-                <div id="hostfully-ical-link-table" style="margin-top:10px;"></div>
-                <pre id="hostfully-ical-link-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
+                <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
+                    <h2 style="margin:0 0 8px; font-size:16px;">iCal Tools</h2>
+                    <p style="margin-top:0;">These are only needed for channel-calendar audits and linking external feeds into MotoPress.</p>
+                    <p>
+                        <label for="hostfully-ical-report-limit" style="margin-right:8px;">Max properties to scan</label>
+                        <input id="hostfully-ical-report-limit" type="number" min="1" max="200" value="50" style="width:120px;" title="Limit how many properties the iCal audit scans in one run.">
+                        <button id="hostfully-ical-report-run" class="button" style="margin-left:8px;" title="Check which properties have channel links but are missing Hostfully iCal feeds.">Run iCal Audit</button>
+                        <button id="hostfully-ical-report-csv" class="button" style="margin-left:6px;" title="Download a CSV of properties flagged by the iCal audit as needing setup.">Download Needs Setup CSV</button>
+                        <span id="hostfully-ical-report-status" style="margin-left:8px; color:#666;"></span>
+                        <span id="hostfully-ical-report-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                    </p>
+                    <div id="hostfully-ical-report-table" style="margin-top:10px;"></div>
+                    <pre id="hostfully-ical-report-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
+                    <hr>
+                    <p>
+                        <label for="hostfully-ical-link-limit" style="margin-right:8px;">Max properties to scan</label>
+                        <input id="hostfully-ical-link-limit" type="number" min="1" max="200" value="50" style="width:120px;" title="Limit how many properties the iCal link step processes in one run.">
+                        <button id="hostfully-ical-link-run" class="button" style="margin-left:8px;" title="Write Hostfully iCal feed URLs into matching MotoPress accommodation units.">Link iCal Feeds</button>
+                        <span id="hostfully-ical-link-status" style="margin-left:8px; color:#666;"></span>
+                        <span id="hostfully-ical-link-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                    </p>
+                    <label style="display:block; margin:-4px 0 10px;">
+                        <input type="checkbox" id="hostfully-ical-link-replace" value="1" title="Overwrite existing MotoPress external calendar URLs instead of preserving them.">
+                        Replace existing external calendars (overwrite)
+                    </label>
+                    <p class="description" style="margin:0 0 10px;">Use the audit first if you are unsure. Use the link step only when you intentionally want Hostfully iCal feeds written into MotoPress.</p>
+                    <div id="hostfully-ical-link-table" style="margin-top:10px;"></div>
+                    <pre id="hostfully-ical-link-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
+                </div>
             </div>
         </details>
 
@@ -4025,7 +4029,7 @@ function hostfully_mphb_render_admin()
         <details id="hostfully-step-meta" data-step="hostfully-step-meta">
             <summary><strong>Reference: Elementor Meta Helper</strong></summary>
             <div style="margin-top:8px;">
-                <p>Use these custom field keys with Elementor Dynamic Tags → Post Custom Field.</p>
+                <p>Use these custom field keys with Elementor Dynamic Tags → Post Custom Field. This section is reference-only and does not change imported data.</p>
                 <table class="widefat fixed striped" style="max-width:900px;">
                     <thead>
                         <tr>
@@ -4144,33 +4148,6 @@ function hostfully_mphb_render_admin()
                 </table>
             </div>
         </details>
-        <p>If Hostfully’s property list doesn’t return everything, paste a list of property UIDs below (from a Hostfully export or UI copy). We’ll import only those UIDs.</p>
-        <form id="hostfully-uid-import-form">
-            <?php wp_nonce_field('hostfully_mphb_import_uids'); ?>
-            <p>
-                <label for="hostfully_uid_list"><strong>Property UIDs (one per line or CSV)</strong></label><br>
-                <textarea id="hostfully_uid_list" name="uids_raw" rows="5" style="width:620px; max-width:100%;"></textarea>
-            </p>
-            <p>
-                <button class="button" id="hostfully-uid-compare">Compare & Show Missing</button>
-                <span style="margin-left:6px; color:#666;">Compares pasted UIDs vs already-imported ones.</span>
-            </p>
-            <p>
-                <label for="hostfully_uid_missing"><strong>Missing UIDs (not imported yet)</strong></label><br>
-                <textarea id="hostfully_uid_missing" rows="5" style="width:620px; max-width:100%;" readonly></textarea>
-            </p>
-            <p>
-                <button class="button" id="hostfully-uid-use-missing">Use Missing as Import List</button>
-            </p>
-            <p>
-                <label>
-                    <input type="checkbox" id="hostfully-uid-update-existing" value="1"> Update existing imports too
-                </label>
-            </p>
-            <p>
-                <button class="button button-primary" id="hostfully-uid-start">Import UIDs</button>
-            </p>
-        </form>
     </div>
 <?php
 }
@@ -4264,43 +4241,6 @@ add_action('wp_ajax_hostfully_mphb_bulk_start', function () {
         'update_slugs' => $update_slugs,
         'last_error' => hostfully_mphb_get_last_error(),
         'log' => $start_log,
-    ]);
-});
-
-add_action('wp_ajax_hostfully_mphb_migrate_start', function () {
-    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
-    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
-
-    $imported = hostfully_mphb_get_imported_uids();
-    $queue = array_values($imported);
-
-    update_option(HOSTFULLY_MPHB_OPT_QUEUE, $queue, false);
-
-    $update_slugs = !empty($_POST['update_slugs']);
-    $progress = [
-        'total'      => count($queue),
-        'done'       => 0,
-        'last'       => null,
-        'errors'     => 0,
-        'created'    => 0,
-        'updated'    => 0,
-        'update_slugs' => $update_slugs,
-        'started_at' => time(),
-    ];
-    update_option(HOSTFULLY_MPHB_OPT_PROGRESS, $progress, false);
-
-    $log = [];
-    $log[] = 'Migration queue prepared: ' . count($queue) . ' imported properties.';
-    if (empty($queue)) {
-        $log[] = 'Nothing to migrate.';
-    }
-
-    wp_send_json_success([
-        'total' => $progress['total'],
-        'queue' => $queue,
-        'last_error' => hostfully_mphb_get_last_error(),
-        'log' => $log,
-        'update_slugs' => $update_slugs,
     ]);
 });
 

@@ -8,6 +8,7 @@
   const jsIndicator = document.getElementById('hostfully-js-indicator');
   const spinner = document.getElementById('hostfully-spinner');
   const counterEl = document.getElementById('hostfully-counter');
+  const postImportSyncBtn = document.getElementById('hostfully-post-import-sync');
 
   if (!startBtn || !stopBtn || !wrap || !statusEl || !logEl) {
     return;
@@ -53,7 +54,6 @@
   const icalLinkSpinner = document.getElementById('hostfully-ical-link-spinner');
   const icalLinkTable = document.getElementById('hostfully-ical-link-table');
   const icalLinkLog = document.getElementById('hostfully-ical-link-log');
-  const migrateBtn = document.getElementById('hostfully-migrate-start');
   const cleanupBtn = document.getElementById('hostfully-cleanup-terms');
   const wrapEl = document.querySelector('.wrap[data-next-action]');
   const nextActionStep = wrapEl ? wrapEl.getAttribute('data-next-action') : '';
@@ -570,15 +570,6 @@
     });
   }
 
-  const importOneDetails = document.getElementById('hostfully-step-one');
-  if (importOneDetails) {
-    importOneDetails.addEventListener('toggle', function () {
-      if (importOneDetails.open && !propertiesLoaded) {
-        loadProperties();
-      }
-    });
-  }
-
   function loadDetailState() {
     if (!detailEls.length) return;
     let stored = null;
@@ -613,6 +604,12 @@
   });
 
   loadDetailState();
+
+  document.querySelectorAll('[data-copy]').forEach((btn) => {
+    if (!btn.getAttribute('title')) {
+      btn.setAttribute('title', 'Copy this meta key to the clipboard for use in Elementor or other template fields.');
+    }
+  });
 
 
   function appendLog(lines) {
@@ -884,80 +881,6 @@
     await tickLoop();
   });
 
-  if (migrateBtn) {
-    migrateBtn.addEventListener('click', async function (e) {
-      e.preventDefault();
-      const ok = window.confirm('Migration will update all imported properties to apply the latest mapping rules. Continue?');
-      if (!ok) return;
-      const updateSlugsOpt = document.getElementById('hostfully-migrate-update-slugs');
-      const updateSlugs = updateSlugsOpt && updateSlugsOpt.checked ? '1' : '0';
-      stopped = false;
-      wrap.style.display = 'block';
-      logEl.textContent = '';
-      setBusy(true);
-      resetCounter();
-      if (summaryEl) {
-        summaryEl.textContent = '';
-        summaryEl.style.display = 'none';
-      }
-      statusEl.textContent = 'Preparing migration queue…';
-
-      migrateBtn.disabled = true;
-      stopBtn.disabled = false;
-      startBtn.disabled = true;
-      if (uidStartBtn) uidStartBtn.disabled = true;
-
-      let r = null;
-      try {
-        r = await post('hostfully_mphb_migrate_start', {
-          update_slugs: updateSlugs,
-        });
-        if (r && r.success) markJsOk();
-      } catch (err) {
-        showError('Migration start failed', err);
-        stopBtn.disabled = true;
-        startBtn.disabled = false;
-        migrateBtn.disabled = false;
-        if (uidStartBtn) uidStartBtn.disabled = false;
-        return;
-      }
-
-      if (!r || !r.success) {
-        statusEl.textContent = 'Error';
-        setBusy(false);
-        resetCounter();
-        appendLog(['Migration start failed.', JSON.stringify(r)]);
-        stopBtn.disabled = true;
-        startBtn.disabled = false;
-        migrateBtn.disabled = false;
-        if (uidStartBtn) uidStartBtn.disabled = false;
-        return;
-      }
-
-      const total = (r.data && r.data.total) || 0;
-      if (r.data && Array.isArray(r.data.log) && r.data.log.length) {
-        appendLog(r.data.log);
-      }
-      appendLog([`Migration queue prepared. Total to update: ${total}`]);
-      if (r.data && r.data.last_error) logLastError(r.data.last_error);
-
-      if (total === 0) {
-        statusEl.textContent = 'Nothing to migrate.';
-        setBusy(false);
-        resetCounter();
-        stopBtn.disabled = true;
-        startBtn.disabled = false;
-        migrateBtn.disabled = false;
-        if (uidStartBtn) uidStartBtn.disabled = false;
-        return;
-      }
-
-      await tickLoop();
-      migrateBtn.disabled = false;
-      if (uidStartBtn) uidStartBtn.disabled = false;
-    });
-  }
-
   if (cleanupBtn) {
     cleanupBtn.addEventListener('click', async function (e) {
       e.preventDefault();
@@ -1011,6 +934,94 @@
   const syncAmenitiesBtn = document.getElementById('hostfully-sync-amenities');
   const syncPropertyFeesBtn = document.getElementById('hostfully-sync-property-fees');
   const syncGuestCapacityBtn = document.getElementById('hostfully-sync-guest-capacity');
+
+  async function runPropertyFeeSync() {
+    wrap.style.display = 'block';
+    statusEl.textContent = 'Syncing property fees…';
+    appendLog(['—', 'Starting property fee sync…']);
+    setBusy(true);
+
+    const batchSize = 10;
+    let offset = 0;
+    let total = 0;
+    let updated = 0;
+    let skipped = 0;
+    let errors = 0;
+    let done = false;
+
+    while (!done) {
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_sync_property_fees', {
+          offset: String(offset),
+          batch_size: String(batchSize),
+        });
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('Property fee sync failed', err);
+        throw err;
+      }
+      if (!r || !r.success) {
+        statusEl.textContent = 'Property fee sync error';
+        setBusy(false);
+        appendLog(['Property fee sync failed.', JSON.stringify(r)]);
+        throw new Error('Property fee sync failed.');
+      }
+
+      const d = r.data || {};
+      const result = d.result || {};
+      appendLog([...(d.log || [])]);
+
+      total = Number.isFinite(result.total) ? result.total : total;
+      updated += Number.isFinite(result.updated) ? result.updated : 0;
+      skipped += Number.isFinite(result.skipped) ? result.skipped : 0;
+      errors += Number.isFinite(result.errors) ? result.errors : 0;
+      offset = Number.isFinite(result.next_offset) ? result.next_offset : offset + batchSize;
+      done = !!result.done || (total > 0 && offset >= total);
+
+      const checked = total > 0 ? Math.min(offset, total) : offset;
+      statusEl.textContent = `Syncing property fees… ${checked}${total ? ` / ${total}` : ''}`;
+
+      if (!done) await sleep(200);
+    }
+
+    statusEl.textContent = `Property fees synced ✅ (${updated} updated, ${skipped} skipped, ${errors} errors)`;
+    setBusy(false);
+
+    return { total, updated, skipped, errors };
+  }
+
+  async function runGuestCapacitySync() {
+    wrap.style.display = 'block';
+    statusEl.textContent = 'Syncing guest capacity…';
+    appendLog(['—', 'Starting guest capacity sync…']);
+    setBusy(true);
+
+    let r = null;
+    try {
+      r = await post('hostfully_mphb_sync_guest_capacity');
+      if (r && r.success) markJsOk();
+    } catch (err) {
+      showError('Guest capacity sync failed', err);
+      throw err;
+    }
+    if (!r || !r.success) {
+      statusEl.textContent = 'Guest capacity sync error';
+      setBusy(false);
+      appendLog(['Guest capacity sync failed.', JSON.stringify(r)]);
+      throw new Error('Guest capacity sync failed.');
+    }
+
+    const d = r.data || {};
+    appendLog([...(d.log || [])]);
+    const updated = (d.result && Number.isFinite(d.result.updated)) ? d.result.updated : 0;
+    const scanned = (d.result && Number.isFinite(d.result.scanned)) ? d.result.scanned : 0;
+    statusEl.textContent = `Guest capacity synced ✅ (${updated}/${scanned} updated)`;
+    setBusy(false);
+
+    return { updated, scanned };
+  }
+
   if (syncAmenitiesBtn) {
     syncAmenitiesBtn.addEventListener('click', async function (e) {
       e.preventDefault();
@@ -1050,118 +1061,26 @@
   if (syncPropertyFeesBtn) {
     syncPropertyFeesBtn.addEventListener('click', async function (e) {
       e.preventDefault();
-      wrap.style.display = 'block';
-      statusEl.textContent = 'Syncing property fees…';
-      appendLog(['—', 'Starting property fee sync…']);
-      setBusy(true);
-
       syncPropertyFeesBtn.disabled = true;
-
-      const batchSize = 10;
-      let offset = 0;
-      let total = 0;
-      let updated = 0;
-      let skipped = 0;
-      let errors = 0;
-      let done = false;
-
-      while (!done) {
-        let r = null;
-        try {
-          r = await post('hostfully_mphb_sync_property_fees', {
-            offset: String(offset),
-            batch_size: String(batchSize),
-          });
-          if (r && r.success) markJsOk();
-        } catch (err) {
-          showError('Property fee sync failed', err);
-          syncPropertyFeesBtn.disabled = false;
-          return;
-        }
-        if (!r || !r.success) {
-          statusEl.textContent = 'Property fee sync error';
-          setBusy(false);
-          appendLog(['Property fee sync failed.', JSON.stringify(r)]);
-          syncPropertyFeesBtn.disabled = false;
-          return;
-        }
-
-        const d = r.data || {};
-        const result = d.result || {};
-        appendLog([...(d.log || [])]);
-
-        total = Number.isFinite(result.total) ? result.total : total;
-        updated += Number.isFinite(result.updated) ? result.updated : 0;
-        skipped += Number.isFinite(result.skipped) ? result.skipped : 0;
-        errors += Number.isFinite(result.errors) ? result.errors : 0;
-        offset = Number.isFinite(result.next_offset) ? result.next_offset : offset + batchSize;
-        done = !!result.done || (total > 0 && offset >= total);
-
-        if (statusEl) {
-          const checked = total > 0 ? Math.min(offset, total) : offset;
-          statusEl.textContent = `Syncing property fees… ${checked}${total ? ` / ${total}` : ''}`;
-        }
-
-        if (!done) await sleep(200);
+      try {
+        await runPropertyFeeSync();
+      } finally {
+        syncPropertyFeesBtn.disabled = false;
       }
-
-      statusEl.textContent = `Property fees synced ✅ (${updated} updated, ${skipped} skipped, ${errors} errors)`;
-      setBusy(false);
-      syncPropertyFeesBtn.disabled = false;
     });
   }
 
   if (syncGuestCapacityBtn) {
     syncGuestCapacityBtn.addEventListener('click', async function (e) {
       e.preventDefault();
-      wrap.style.display = 'block';
-      statusEl.textContent = 'Syncing guest capacity…';
-      appendLog(['—', 'Starting guest capacity sync…']);
-      setBusy(true);
-
       syncGuestCapacityBtn.disabled = true;
-
-      let r = null;
       try {
-        r = await post('hostfully_mphb_sync_guest_capacity');
-        if (r && r.success) markJsOk();
-      } catch (err) {
-        showError('Guest capacity sync failed', err);
+        await runGuestCapacitySync();
+      } finally {
         syncGuestCapacityBtn.disabled = false;
-        return;
       }
-      if (!r || !r.success) {
-        statusEl.textContent = 'Guest capacity sync error';
-        setBusy(false);
-        appendLog(['Guest capacity sync failed.', JSON.stringify(r)]);
-        syncGuestCapacityBtn.disabled = false;
-        return;
-      }
-
-      const d = r.data || {};
-      appendLog([...(d.log || [])]);
-      const updated = (d.result && Number.isFinite(d.result.updated)) ? d.result.updated : 0;
-      const scanned = (d.result && Number.isFinite(d.result.scanned)) ? d.result.scanned : 0;
-      statusEl.textContent = `Guest capacity synced ✅ (${updated}/${scanned} updated)`;
-      setBusy(false);
-      syncGuestCapacityBtn.disabled = false;
     });
   }
-
-  document.addEventListener('click', async function (e) {
-    const btn = e.target && e.target.closest ? e.target.closest('[data-copy]') : null;
-    if (!btn) return;
-    const val = btn.getAttribute('data-copy') || '';
-    const ok = await copyText(val);
-    const prev = btn.textContent;
-    btn.textContent = ok ? 'Copied' : 'Failed';
-    btn.disabled = true;
-    setTimeout(() => {
-      btn.textContent = prev;
-      btn.disabled = false;
-    }, 1200);
-  });
-
 
   if (importOneForm) {
     importOneForm.addEventListener('submit', async function (e) {
@@ -1230,6 +1149,42 @@
       }
       if (importOneSpinner) importOneSpinner.classList.remove('is-active');
       if (importOneBtn) importOneBtn.disabled = false;
+    });
+  }
+
+  if (postImportSyncBtn) {
+    postImportSyncBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+
+      const ok = window.confirm('Post-Import Sync will run property fee sync and guest capacity sync. Continue?');
+      if (!ok) return;
+
+      wrap.style.display = 'block';
+      logEl.textContent = '';
+      setBusy(false);
+      resetCounter();
+      if (summaryEl) {
+        summaryEl.textContent = '';
+        summaryEl.style.display = 'none';
+      }
+
+      postImportSyncBtn.disabled = true;
+      if (syncPropertyFeesBtn) syncPropertyFeesBtn.disabled = true;
+      if (syncGuestCapacityBtn) syncGuestCapacityBtn.disabled = true;
+
+      try {
+        const feeResult = await runPropertyFeeSync();
+        await sleep(150);
+        const guestResult = await runGuestCapacitySync();
+        statusEl.textContent = `Post-import sync complete ✅ (fees: ${feeResult.updated} updated, ${feeResult.skipped} skipped, ${feeResult.errors} errors; guest capacity: ${guestResult.updated}/${guestResult.scanned} updated)`;
+        showToast('Post-import sync completed.', 'success');
+      } catch (err) {
+        showToast('Post-import sync failed.', 'error');
+      } finally {
+        postImportSyncBtn.disabled = false;
+        if (syncPropertyFeesBtn) syncPropertyFeesBtn.disabled = false;
+        if (syncGuestCapacityBtn) syncGuestCapacityBtn.disabled = false;
+      }
     });
   }
 
