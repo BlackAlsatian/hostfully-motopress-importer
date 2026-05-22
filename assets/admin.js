@@ -9,6 +9,7 @@
   const spinner = document.getElementById('hostfully-spinner');
   const counterEl = document.getElementById('hostfully-counter');
   const postImportSyncBtn = document.getElementById('hostfully-post-import-sync');
+  const syncNameAliasesBtn = document.getElementById('hostfully-sync-name-aliases');
 
   if (!startBtn || !stopBtn || !wrap || !statusEl || !logEl) {
     return;
@@ -47,6 +48,15 @@
   const icalReportSpinner = document.getElementById('hostfully-ical-report-spinner');
   const icalReportTable = document.getElementById('hostfully-ical-report-table');
   const icalReportLog = document.getElementById('hostfully-ical-report-log');
+  const icalExportCsvBtn = document.getElementById('hostfully-ical-export-csv');
+  const icalExportStatus = document.getElementById('hostfully-ical-export-status');
+  const icalExportSpinner = document.getElementById('hostfully-ical-export-spinner');
+  const icalAllowlistFile = document.getElementById('hostfully-ical-allowlist-file');
+  const icalAllowlistBtn = document.getElementById('hostfully-ical-allowlist-run');
+  const icalAllowlistStatus = document.getElementById('hostfully-ical-allowlist-status');
+  const icalAllowlistSpinner = document.getElementById('hostfully-ical-allowlist-spinner');
+  const icalAllowlistTable = document.getElementById('hostfully-ical-allowlist-table');
+  const icalAllowlistLog = document.getElementById('hostfully-ical-allowlist-log');
   const icalLinkBtn = document.getElementById('hostfully-ical-link-run');
   const icalLinkLimit = document.getElementById('hostfully-ical-link-limit');
   const icalLinkReplace = document.getElementById('hostfully-ical-link-replace');
@@ -145,12 +155,30 @@
     }
   }
 
+  function setIcalExportBusy(isBusy) {
+    if (!icalExportSpinner) return;
+    if (isBusy) {
+      icalExportSpinner.classList.add('is-active');
+    } else {
+      icalExportSpinner.classList.remove('is-active');
+    }
+  }
+
   function setIcalLinkBusy(isBusy) {
     if (!icalLinkSpinner) return;
     if (isBusy) {
       icalLinkSpinner.classList.add('is-active');
     } else {
       icalLinkSpinner.classList.remove('is-active');
+    }
+  }
+
+  function setIcalAllowlistBusy(isBusy) {
+    if (!icalAllowlistSpinner) return;
+    if (isBusy) {
+      icalAllowlistSpinner.classList.add('is-active');
+    } else {
+      icalAllowlistSpinner.classList.remove('is-active');
     }
   }
 
@@ -205,7 +233,7 @@
 
   function buildIcalCsv(items) {
     const header = ['Property', 'UID', 'Channels', 'iCal count', 'Needs setup'];
-    const rows = [header.join(',')];
+    const rows = [buildCsvLine(header)];
     items.forEach((item) => {
       const channels = (item.channels || []).join(' | ');
       const row = [
@@ -217,19 +245,53 @@
       ];
       rows.push(row.join(','));
     });
-    return rows.join('\n');
+    return rows.join('\r\n');
+  }
+
+  function buildPropertyIcalExportCsv(items) {
+    const header = [
+      'Property',
+      'UID',
+      'Status',
+      'Property page URL',
+      'WordPress admin edit URL',
+      'Room ID',
+      'Room',
+      'WordPress export iCal URL',
+      'WordPress import iCal URLs',
+      'Notes',
+    ];
+    const rows = [buildCsvLine(header)];
+    items.forEach((item) => {
+      const importUrls = (item.wp_import_urls || []).join(' | ');
+      const row = [
+        csvEscape(item.property_name || ''),
+        csvEscape(item.uid || ''),
+        csvEscape(item.property_status || ''),
+        csvEscape(item.property_url || ''),
+        csvEscape(item.property_admin_url || ''),
+        csvEscape(item.room_id ? String(item.room_id) : ''),
+        csvEscape(item.room_name || ''),
+        csvEscape(item.wp_export_url || ''),
+        csvEscape(importUrls),
+        csvEscape(item.notes || ''),
+      ];
+      rows.push(row.join(','));
+    });
+    return rows.join('\r\n');
+  }
+
+  function buildCsvLine(values) {
+    return values.map((value) => csvEscape(value)).join(',');
   }
 
   function csvEscape(value) {
     const text = value == null ? '' : String(value);
-    if (/[",\n]/.test(text)) {
-      return '"' + text.replace(/"/g, '""') + '"';
-    }
-    return text;
+    return '"' + text.replace(/"/g, '""') + '"';
   }
 
   function downloadCsv(filename, csvText) {
-    const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob(['\uFEFF', csvText], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -260,6 +322,17 @@
       icalLinkLog.textContent = text;
     }
     icalLinkLog.style.display = 'block';
+  }
+
+  function appendIcalAllowlistLog(lines) {
+    if (!icalAllowlistLog || !lines || !lines.length) return;
+    const text = lines.join('\n');
+    if (icalAllowlistLog.textContent) {
+      icalAllowlistLog.textContent += '\n' + text;
+    } else {
+      icalAllowlistLog.textContent = text;
+    }
+    icalAllowlistLog.style.display = 'block';
   }
 
   function renderIcalLinkReport(items) {
@@ -315,6 +388,63 @@
 
     table.appendChild(tbody);
     icalLinkTable.appendChild(table);
+  }
+
+  function renderIcalAllowlistReport(items) {
+    if (!icalAllowlistTable) return;
+    icalAllowlistTable.innerHTML = '';
+
+    const table = document.createElement('table');
+    table.className = 'widefat striped';
+    table.style.width = '100%';
+    table.style.maxWidth = '900px';
+    table.style.tableLayout = 'auto';
+
+    const thead = document.createElement('thead');
+    thead.innerHTML =
+      '<tr>' +
+      '<th style="width:220px;">Sheet Title</th>' +
+      '<th style="width:220px;">Matched WordPress Title</th>' +
+      '<th style="width:240px;">UID</th>' +
+      '<th style="width:90px;">iCal count</th>' +
+      '<th style="width:90px;">Linked</th>' +
+      '<th>Status</th>' +
+      '</tr>';
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+
+    if (!items || !items.length) {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = 6;
+      cell.textContent = 'No properties processed.';
+      row.appendChild(cell);
+      tbody.appendChild(row);
+    } else {
+      items.forEach((item) => {
+        const row = document.createElement('tr');
+        row.innerHTML =
+          '<td style="white-space:normal; word-break:break-word;">' +
+          escapeHtml(item.sheet_title || 'Unnamed') +
+          '</td>' +
+          '<td style="white-space:normal; word-break:break-word;">' +
+          escapeHtml(item.matched_title || '-') +
+          '</td>' +
+          '<td style="white-space:normal; word-break:break-word;">' +
+          escapeHtml(item.uid || '') +
+          '</td>' +
+          '<td>' + escapeHtml(String(item.ical_count || 0)) + '</td>' +
+          '<td>' + escapeHtml(String(item.linked_count || 0)) + '</td>' +
+          '<td style="white-space:normal; word-break:break-word;">' +
+          escapeHtml(item.status || '-') +
+          '</td>';
+        tbody.appendChild(row);
+      });
+    }
+
+    table.appendChild(tbody);
+    icalAllowlistTable.appendChild(table);
   }
 
   function escapeHtml(value) {
@@ -555,6 +685,93 @@
     });
   }
 
+  if (icalAllowlistBtn) {
+    icalAllowlistBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+
+      if (!icalAllowlistFile || !icalAllowlistFile.files || !icalAllowlistFile.files.length) {
+        showToast('Choose an XLSX, CSV, or TXT file first.', 'error');
+        return;
+      }
+
+      const ok = window.confirm(
+        'This will match uploaded titles to imported accommodations, replace their MotoPress iCal URL list with the uploaded URLs, and draft imported properties not on the active list only if every uploaded row matches safely. Continue?'
+      );
+      if (!ok) return;
+      let finalData = null;
+
+      if (icalAllowlistStatus) icalAllowlistStatus.textContent = 'Running…';
+      if (icalAllowlistLog) {
+        icalAllowlistLog.textContent = '';
+        icalAllowlistLog.style.display = 'none';
+      }
+      if (icalAllowlistTable) icalAllowlistTable.innerHTML = '';
+      setIcalAllowlistBusy(true);
+      icalAllowlistBtn.disabled = true;
+      let r = null;
+      try {
+        r = await postMultipart(
+          'hostfully_mphb_apply_ical_allowlist',
+          {},
+          'allowlist_file',
+          icalAllowlistFile.files[0]
+        );
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('Active property file import failed', err);
+        if (icalAllowlistStatus) icalAllowlistStatus.textContent = 'Failed';
+        setIcalAllowlistBusy(false);
+        icalAllowlistBtn.disabled = false;
+        return;
+      }
+
+      if (!r || !r.success) {
+        showError('Active property file import failed', new Error('Unexpected response.'));
+        if (icalAllowlistStatus) icalAllowlistStatus.textContent = 'Failed';
+        setIcalAllowlistBusy(false);
+        icalAllowlistBtn.disabled = false;
+        return;
+      }
+
+      finalData = r.data || {};
+      if (finalData.log && finalData.log.length) appendIcalAllowlistLog(finalData.log);
+
+      renderIcalAllowlistReport(finalData.items || []);
+      setIcalAllowlistBusy(false);
+      icalAllowlistBtn.disabled = false;
+
+      if (finalData && icalAllowlistStatus) {
+        if (finalData.safety_stop) {
+          icalAllowlistStatus.textContent =
+            `Linked ${finalData.linked_rooms || 0} | Draft blocked | Unmatched ${finalData.unmatched_rows || 0} | Ambiguous ${finalData.ambiguous_rows || 0}`;
+        } else {
+          icalAllowlistStatus.textContent =
+            `Linked ${finalData.linked_rooms || 0} | Matched ${finalData.matched_rows || 0} | Drafted ${finalData.drafted || 0}`;
+        }
+      }
+
+      if (finalData && finalData.unmatched_titles_preview && finalData.unmatched_titles_preview.length) {
+        appendIcalAllowlistLog([
+          'Unmatched uploaded titles (first 20):',
+          ...finalData.unmatched_titles_preview,
+        ]);
+      }
+
+      if (finalData && finalData.ambiguous_titles_preview && finalData.ambiguous_titles_preview.length) {
+        appendIcalAllowlistLog([
+          'Ambiguous uploaded titles (first 20):',
+          ...finalData.ambiguous_titles_preview,
+        ]);
+      }
+
+      if (finalData && finalData.safety_stop) {
+        showToast('Some uploaded titles did not match cleanly. URLs were linked where possible, but drafting was blocked.', 'error');
+      } else {
+        showToast(`Linked ${finalData && finalData.linked_rooms ? finalData.linked_rooms : 0} rooms and drafted ${finalData && finalData.drafted ? finalData.drafted : 0} properties.`, 'success');
+      }
+    });
+  }
+
   if (icalReportCsvBtn) {
     icalReportCsvBtn.addEventListener('click', function (e) {
       e.preventDefault();
@@ -567,6 +784,48 @@
       const stamp = new Date().toISOString().slice(0, 10);
       downloadCsv(`hostfully-ical-needs-setup-${stamp}.csv`, csv);
       showToast(`Downloaded ${needsSetup.length} rows.`, 'success');
+    });
+  }
+
+  if (icalExportCsvBtn) {
+    icalExportCsvBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      if (icalExportStatus) icalExportStatus.textContent = 'Preparing…';
+      setIcalExportBusy(true);
+      icalExportCsvBtn.disabled = true;
+
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_export_property_icals', {});
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('Property iCal export failed', err);
+        if (icalExportStatus) icalExportStatus.textContent = 'Failed';
+        setIcalExportBusy(false);
+        icalExportCsvBtn.disabled = false;
+        return;
+      }
+
+      if (!r || !r.success) {
+        showError('Property iCal export failed', new Error('Unexpected response.'));
+        if (icalExportStatus) icalExportStatus.textContent = 'Failed';
+        setIcalExportBusy(false);
+        icalExportCsvBtn.disabled = false;
+        return;
+      }
+
+      const data = r.data || {};
+      const items = data.items || [];
+      const csv = buildPropertyIcalExportCsv(items);
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadCsv(`hostfully-property-icals-${stamp}.csv`, csv);
+
+      if (icalExportStatus) {
+        icalExportStatus.textContent = `Downloaded ${items.length} rows`;
+      }
+      setIcalExportBusy(false);
+      icalExportCsvBtn.disabled = false;
+      showToast(`Downloaded ${items.length} property iCal rows.`, 'success');
     });
   }
 
@@ -717,6 +976,46 @@
         nonce: HOSTFULLY_MPHB.nonce,
         ...payload,
       }),
+    });
+
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch (err) {
+      const snippet = text ? text.slice(0, 300) : '(empty response)';
+      throw new Error(`Non-JSON response (HTTP ${res.status}). ${snippet}`);
+    }
+
+    if (!res.ok) {
+      json = json || {};
+      json._http_status = res.status;
+      json._http_text = text ? text.slice(0, 300) : '';
+    }
+
+    return json;
+  }
+
+  async function postMultipart(action, payload = {}, fileFieldName, file) {
+    if (!window.HOSTFULLY_MPHB || !HOSTFULLY_MPHB.ajax_url) {
+      throw new Error('HOSTFULLY_MPHB settings are missing. Script localization failed.');
+    }
+
+    const body = new FormData();
+    body.append('action', action);
+    body.append('nonce', HOSTFULLY_MPHB.nonce);
+    Object.entries(payload).forEach(([key, value]) => {
+      body.append(key, value == null ? '' : String(value));
+    });
+    if (fileFieldName && file) {
+      body.append(fileFieldName, file);
+    }
+
+    const res = await fetch(HOSTFULLY_MPHB.ajax_url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      body,
     });
 
     const text = await res.text();
@@ -935,6 +1234,62 @@
   const syncPropertyFeesBtn = document.getElementById('hostfully-sync-property-fees');
   const syncGuestCapacityBtn = document.getElementById('hostfully-sync-guest-capacity');
 
+  async function runNameAliasSync() {
+    wrap.style.display = 'block';
+    statusEl.textContent = 'Syncing name aliases…';
+    appendLog(['—', 'Starting name alias sync…']);
+    setBusy(true);
+
+    const batchSize = 10;
+    let offset = 0;
+    let total = 0;
+    let updated = 0;
+    let skipped = 0;
+    let errors = 0;
+    let done = false;
+
+    while (!done) {
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_sync_property_name_aliases', {
+          offset: String(offset),
+          batch_size: String(batchSize),
+        });
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError('Name alias sync failed', err);
+        throw err;
+      }
+      if (!r || !r.success) {
+        statusEl.textContent = 'Name alias sync error';
+        setBusy(false);
+        appendLog(['Name alias sync failed.', JSON.stringify(r)]);
+        throw new Error('Name alias sync failed.');
+      }
+
+      const d = r.data || {};
+      const result = d.result || {};
+      appendLog([...(d.log || [])]);
+
+      total = Number.isFinite(result.total) ? result.total : total;
+      updated += Number.isFinite(result.updated) ? result.updated : 0;
+      skipped += Number.isFinite(result.skipped) ? result.skipped : 0;
+      errors += Number.isFinite(result.errors) ? result.errors : 0;
+      offset = Number.isFinite(result.next_offset) ? result.next_offset : offset + batchSize;
+      done = !!result.done || (total > 0 && offset >= total);
+
+      const checked = total > 0 ? Math.min(offset, total) : offset;
+      statusEl.textContent = `Syncing name aliases… ${checked}${total ? ` / ${total}` : ''}`;
+
+      if (!done) await sleep(200);
+    }
+
+    statusEl.textContent = `Name aliases synced ✅ (${updated} updated, ${skipped} skipped, ${errors} errors)`;
+    setBusy(false);
+
+    return { total, updated, skipped, errors };
+  }
+
   async function runPropertyFeeSync() {
     wrap.style.display = 'block';
     statusEl.textContent = 'Syncing property fees…';
@@ -1078,6 +1433,18 @@
         await runGuestCapacitySync();
       } finally {
         syncGuestCapacityBtn.disabled = false;
+      }
+    });
+  }
+
+  if (syncNameAliasesBtn) {
+    syncNameAliasesBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      syncNameAliasesBtn.disabled = true;
+      try {
+        await runNameAliasSync();
+      } finally {
+        syncNameAliasesBtn.disabled = false;
       }
     });
   }

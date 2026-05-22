@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer (Temporary)
  * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.39
+ * Version: 0.40
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -523,6 +523,920 @@ function hostfully_mphb_fetch_property_channel_links(string $property_uid, array
     if (!empty($data['propertyChannelLinks']) && is_array($data['propertyChannelLinks'])) return $data['propertyChannelLinks'];
     if (!empty($data['items']) && is_array($data['items'])) return $data['items'];
     return [];
+}
+
+function hostfully_mphb_normalize_ical_url(string $url): string
+{
+    $url = html_entity_decode(trim($url), ENT_QUOTES, 'UTF-8');
+    $url = trim($url, " \t\n\r\0\x0B\"'<>[](){}");
+    if ($url === '') return '';
+
+    $url = preg_replace('/\s+/', '', $url);
+    if (!preg_match('#^https?://#i', $url)) return '';
+
+    $parts = wp_parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) {
+        return $url;
+    }
+
+    $scheme = strtolower((string)($parts['scheme'] ?? 'https'));
+    $host = strtolower((string)$parts['host']);
+    $user = isset($parts['user']) ? (string)$parts['user'] : '';
+    $pass = isset($parts['pass']) ? ':' . (string)$parts['pass'] : '';
+    $auth = $user !== '' ? $user . $pass . '@' : '';
+    $port = isset($parts['port']) ? ':' . (int)$parts['port'] : '';
+    $path = isset($parts['path']) ? (string)$parts['path'] : '';
+    $query = isset($parts['query']) ? '?' . (string)$parts['query'] : '';
+    $fragment = isset($parts['fragment']) ? '#' . (string)$parts['fragment'] : '';
+
+    return $scheme . '://' . $auth . $host . $port . $path . $query . $fragment;
+}
+
+function hostfully_mphb_dedupe_normalized_ical_urls(array $urls): array
+{
+    $unique = [];
+    foreach ($urls as $url) {
+        if (!is_string($url)) continue;
+        $normalized = hostfully_mphb_normalize_ical_url($url);
+        if ($normalized === '') continue;
+        $unique[$normalized] = true;
+    }
+
+    return array_keys($unique);
+}
+
+function hostfully_mphb_extract_ical_urls_from_text(string $text): array
+{
+    if ($text === '') return [];
+
+    $matches = [];
+    preg_match_all('#https?://[^\s<>"]+#i', $text, $matches);
+    if (empty($matches[0])) return [];
+
+    return hostfully_mphb_dedupe_normalized_ical_urls($matches[0]);
+}
+
+function hostfully_mphb_extract_ical_urls_from_uploaded_text_file(string $path): array
+{
+    $contents = @file_get_contents($path);
+    if (!is_string($contents) || $contents === '') return [];
+    return hostfully_mphb_extract_ical_urls_from_text($contents);
+}
+
+function hostfully_mphb_normalize_match_title(string $title): string
+{
+    $title = html_entity_decode($title, ENT_QUOTES, 'UTF-8');
+    $title = str_replace(["’", "‘", '–', '—', '·'], ["'", "'", '-', '-', ' - '], $title);
+    $title = trim($title);
+    if ($title === '') return '';
+
+    $title = preg_replace('/^unit\s+\d+\s*[\-\x{2013}\x{2014}]\s*/iu', '', $title);
+    $title = str_replace("'", '', $title);
+    $title = strtolower($title);
+    $title = preg_replace('/[^\pL\pN]+/u', ' ', $title);
+    $title = trim(preg_replace('/\s+/', ' ', $title));
+
+    return $title;
+}
+
+function hostfully_mphb_match_title_part_looks_like_inventory_code(string $part): bool
+{
+    $part = trim(html_entity_decode($part, ENT_QUOTES, 'UTF-8'));
+    if ($part === '') return false;
+
+    if (preg_match('/^[A-Z]{2,}\d*(?:\.\d+)?(?:\s+[A-Z0-9.]+)*$/', $part)) {
+        return true;
+    }
+
+    if (preg_match('/^[A-Z]{1,4}\d+(?:[-.]\d+)+(?:\s+[A-Z0-9.-]+)*$/', $part)) {
+        return true;
+    }
+
+    $normalized = hostfully_mphb_normalize_match_title($part);
+    if ($normalized === '') return false;
+
+    return (bool)preg_match(
+        '/^(?:res|unit\s+\d+|cottage\s+\d+|villa\s+\d+|bhs\s+\d+|bm\d+(?:\s+\d+)?(?:\s+b\d+u\d+)?|[a-z]{1,4}\d+(?:\s+\d+)+)$/',
+        $normalized
+    );
+}
+
+function hostfully_mphb_build_match_title_variants(string $title): array
+{
+    $title = trim(html_entity_decode($title, ENT_QUOTES, 'UTF-8'));
+    if ($title === '') return [];
+
+    $variants = [];
+    $add_variant = static function (string $candidate) use (&$variants): void {
+        $normalized = hostfully_mphb_normalize_match_title($candidate);
+        if ($normalized !== '') {
+            $variants[$normalized] = true;
+        }
+    };
+
+    $add_variant($title);
+
+    $separator_normalized = str_replace(['–', '—', '·'], [' - ', ' - ', ' - '], $title);
+
+    $leading_marker_variant = preg_replace(
+        '/^(unit|cottage|villa|suite|apartment|apt)\s+(\d+)\s*-\s*/iu',
+        '$1 $2 ',
+        $separator_normalized,
+        1,
+        $leading_marker_count
+    );
+    if (!empty($leading_marker_count) && is_string($leading_marker_variant) && $leading_marker_variant !== '') {
+        $add_variant($leading_marker_variant);
+
+        $numeric_marker_variant = preg_replace(
+            '/^(unit|cottage|villa|suite|apartment|apt)\s+(\d+)\s+/iu',
+            '$2 ',
+            $leading_marker_variant,
+            1,
+            $numeric_marker_count
+        );
+
+        if (!empty($numeric_marker_count) && is_string($numeric_marker_variant) && $numeric_marker_variant !== '') {
+            $add_variant($numeric_marker_variant);
+
+            $numeric_parts = preg_split('/\s+-\s+/u', $numeric_marker_variant);
+            if (is_array($numeric_parts) && count($numeric_parts) > 1) {
+                $add_variant((string)$numeric_parts[0]);
+            }
+        }
+    }
+
+    $parts = preg_split('/\s+-\s+/u', $separator_normalized);
+
+    if (is_array($parts) && count($parts) > 1) {
+        for ($i = 1; $i < count($parts); $i++) {
+            $prefix_parts = array_slice($parts, 0, $i);
+            $suffix_parts = array_slice($parts, $i);
+            if (empty($suffix_parts)) continue;
+
+            $prefix_is_inventory = true;
+            foreach ($prefix_parts as $prefix_part) {
+                if (!hostfully_mphb_match_title_part_looks_like_inventory_code((string)$prefix_part)) {
+                    $prefix_is_inventory = false;
+                    break;
+                }
+            }
+
+            if ($prefix_is_inventory) {
+                $add_variant(implode(' - ', $suffix_parts));
+            }
+        }
+
+        $meaningful_index = 0;
+        while ($meaningful_index < count($parts) && hostfully_mphb_match_title_part_looks_like_inventory_code((string)$parts[$meaningful_index])) {
+            $meaningful_index++;
+        }
+
+        $meaningful_parts = array_slice($parts, $meaningful_index);
+        if (count($meaningful_parts) > 1) {
+            $add_variant((string)$meaningful_parts[0]);
+        }
+    }
+
+    return array_keys($variants);
+}
+
+function hostfully_mphb_extract_match_alias_phrases(string $text): array
+{
+    $text = trim(html_entity_decode($text, ENT_QUOTES, 'UTF-8'));
+    if ($text === '') return [];
+
+    $phrases = [];
+
+    if (preg_match_all('/\b(?:at|in|near|on)\s+([^,.!?]+?)(?=\s+(?:offers|is|with|for|just|it|this|features|feature|walk|perfect|from|and)\b|[,.!?]|$)/iu', $text, $matches)) {
+        foreach ((array)($matches[1] ?? []) as $phrase) {
+            $phrase = trim((string)$phrase);
+            if ($phrase === '') continue;
+            $phrases[$phrase] = true;
+        }
+    }
+
+    return array_keys($phrases);
+}
+
+function hostfully_mphb_get_match_candidate_status_rank(string $status): int
+{
+    static $ranks = [
+        'publish' => 50,
+        'private' => 40,
+        'future' => 30,
+        'pending' => 20,
+        'draft' => 10,
+    ];
+
+    return (int)($ranks[$status] ?? 0);
+}
+
+function hostfully_mphb_pick_title_from_row_texts(array $texts): string
+{
+    $best = '';
+
+    foreach ($texts as $text) {
+        if (!is_string($text)) continue;
+        $text = trim(wp_strip_all_tags($text));
+        if ($text === '') continue;
+        if (!empty(hostfully_mphb_extract_ical_urls_from_text($text))) continue;
+        if (mb_strlen($text) > mb_strlen($best)) {
+            $best = $text;
+        }
+    }
+
+    return $best;
+}
+
+function hostfully_mphb_build_uploaded_ical_row(array $texts, array $urls, string $source = ''): ?array
+{
+    $urls = hostfully_mphb_dedupe_normalized_ical_urls($urls);
+    $title = hostfully_mphb_pick_title_from_row_texts($texts);
+    $normalized_variants = hostfully_mphb_build_match_title_variants($title);
+    $normalized_title = $normalized_variants[0] ?? '';
+
+    if ($normalized_title === '' && empty($urls)) {
+        return null;
+    }
+
+    return [
+        'title' => $title,
+        'normalized_title' => $normalized_title,
+        'normalized_variants' => $normalized_variants,
+        'urls' => $urls,
+        'source' => $source,
+    ];
+}
+
+function hostfully_mphb_merge_uploaded_ical_rows(array $rows): array
+{
+    $merged = [];
+
+    foreach ($rows as $row) {
+        if (!is_array($row)) continue;
+
+        $title = is_string($row['title'] ?? null) ? trim($row['title']) : '';
+        $normalized = is_string($row['normalized_title'] ?? null) ? trim($row['normalized_title']) : '';
+        $normalized_variants = array_values(array_unique(array_filter(array_map('strval', (array)($row['normalized_variants'] ?? [])))));
+        $urls = hostfully_mphb_dedupe_normalized_ical_urls((array)($row['urls'] ?? []));
+
+        if ($normalized === '' && empty($urls)) continue;
+        $key = $normalized !== '' ? 't:' . $normalized : 'u:' . md5(implode('|', $urls));
+
+        if (!isset($merged[$key])) {
+            $merged[$key] = [
+                'title' => $title,
+                'normalized_title' => $normalized,
+                'normalized_variants' => $normalized_variants,
+                'urls' => $urls,
+                'source' => (string)($row['source'] ?? ''),
+            ];
+            continue;
+        }
+
+        if ($title !== '' && mb_strlen($title) > mb_strlen((string)$merged[$key]['title'])) {
+            $merged[$key]['title'] = $title;
+        }
+        $merged[$key]['normalized_variants'] = array_values(array_unique(array_merge(
+            (array)$merged[$key]['normalized_variants'],
+            $normalized_variants
+        )));
+        $merged[$key]['urls'] = hostfully_mphb_dedupe_normalized_ical_urls(array_merge($merged[$key]['urls'], $urls));
+    }
+
+    return array_values($merged);
+}
+
+function hostfully_mphb_parse_uploaded_ical_rows_from_csv(string $path): array
+{
+    $contents = @file_get_contents($path);
+    if (!is_string($contents) || $contents === '') return [];
+
+    $lines = preg_split('/\r\n|\n|\r/', $contents);
+    if (!is_array($lines)) return [];
+
+    $sample = '';
+    foreach ($lines as $line) {
+        if (trim((string)$line) !== '') {
+            $sample = (string)$line;
+            break;
+        }
+    }
+
+    $delimiters = [',', ';', "\t", '|'];
+    $best_delimiter = ',';
+    $best_count = -1;
+    foreach ($delimiters as $delimiter) {
+        $count = count(str_getcsv($sample, $delimiter));
+        if ($count > $best_count) {
+            $best_count = $count;
+            $best_delimiter = $delimiter;
+        }
+    }
+
+    $rows = [];
+    foreach ($lines as $index => $line) {
+        if (trim((string)$line) === '') continue;
+
+        $cells = str_getcsv((string)$line, $best_delimiter);
+        $texts = [];
+        $urls = [];
+        foreach ($cells as $cell) {
+            $cell = is_string($cell) ? trim($cell) : '';
+            if ($cell === '') continue;
+            $texts[] = $cell;
+            $urls = array_merge($urls, hostfully_mphb_extract_ical_urls_from_text($cell));
+        }
+
+        $row = hostfully_mphb_build_uploaded_ical_row($texts, $urls, 'csv:' . ($index + 1));
+        if ($row && !empty($row['urls'])) $rows[] = $row;
+    }
+
+    return hostfully_mphb_merge_uploaded_ical_rows($rows);
+}
+
+function hostfully_mphb_parse_uploaded_ical_rows_from_txt(string $path): array
+{
+    $contents = @file_get_contents($path);
+    if (!is_string($contents) || $contents === '') return [];
+
+    $lines = preg_split('/\r\n|\n|\r/', $contents);
+    if (!is_array($lines)) return [];
+
+    $rows = [];
+    foreach ($lines as $index => $line) {
+        $line = trim((string)$line);
+        if ($line === '') continue;
+
+        $urls = hostfully_mphb_extract_ical_urls_from_text($line);
+        $row = hostfully_mphb_build_uploaded_ical_row([$line], $urls, 'txt:' . ($index + 1));
+        if ($row && !empty($row['urls'])) $rows[] = $row;
+    }
+
+    return hostfully_mphb_merge_uploaded_ical_rows($rows);
+}
+
+function hostfully_mphb_extract_xlsx_shared_strings(ZipArchive $zip): array
+{
+    $contents = $zip->getFromName('xl/sharedStrings.xml');
+    if (!is_string($contents) || $contents === '') return [];
+
+    $xml = @simplexml_load_string($contents);
+    if (!$xml) return [];
+
+    $shared = [];
+    foreach ($xml->si as $item) {
+        $text = '';
+        if (isset($item->t)) {
+            $text = (string)$item->t;
+        } elseif (isset($item->r)) {
+            foreach ($item->r as $run) {
+                $text .= (string)$run->t;
+            }
+        }
+        $shared[] = $text;
+    }
+
+    return $shared;
+}
+
+function hostfully_mphb_extract_xlsx_hyperlink_map(ZipArchive $zip, string $sheet_path, SimpleXMLElement $sheet_xml): array
+{
+    $path_info = pathinfo($sheet_path);
+    $rels_path = ($path_info['dirname'] ?? '') . '/_rels/' . ($path_info['basename'] ?? '') . '.rels';
+    $rels_contents = $zip->getFromName($rels_path);
+    if (!is_string($rels_contents) || $rels_contents === '') return [];
+
+    $rels_xml = @simplexml_load_string($rels_contents);
+    if (!$rels_xml) return [];
+
+    $rels_xml->registerXPathNamespace('rel', 'http://schemas.openxmlformats.org/package/2006/relationships');
+    $targets = [];
+    foreach ($rels_xml->xpath('//rel:Relationship') ?: [] as $rel) {
+        $id = (string)$rel['Id'];
+        $target = (string)$rel['Target'];
+        if ($id !== '' && $target !== '') $targets[$id] = $target;
+    }
+
+    $sheet_xml->registerXPathNamespace('main', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main');
+    $sheet_xml->registerXPathNamespace('r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships');
+
+    $map = [];
+    foreach ($sheet_xml->xpath('//main:hyperlinks/main:hyperlink') ?: [] as $hyperlink) {
+        $ref = (string)$hyperlink['ref'];
+        $rid = (string)$hyperlink->attributes('http://schemas.openxmlformats.org/officeDocument/2006/relationships')['id'];
+        if ($ref === '' || $rid === '' || empty($targets[$rid])) continue;
+        $map[$ref] = hostfully_mphb_normalize_ical_url($targets[$rid]);
+    }
+
+    return $map;
+}
+
+function hostfully_mphb_extract_xlsx_cell_text(SimpleXMLElement $cell, array $shared_strings): string
+{
+    $type = (string)$cell['t'];
+
+    if ($type === 's') {
+        $idx = isset($cell->v) ? (int)$cell->v : -1;
+        return ($idx >= 0 && isset($shared_strings[$idx])) ? (string)$shared_strings[$idx] : '';
+    }
+
+    if ($type === 'inlineStr' && isset($cell->is)) {
+        $text = '';
+        if (isset($cell->is->t)) {
+            $text = (string)$cell->is->t;
+        } elseif (isset($cell->is->r)) {
+            foreach ($cell->is->r as $run) {
+                $text .= (string)$run->t;
+            }
+        }
+        return $text;
+    }
+
+    return isset($cell->v) ? (string)$cell->v : '';
+}
+
+function hostfully_mphb_parse_uploaded_ical_rows_from_xlsx(string $path, array &$log): array
+{
+    if (!class_exists('ZipArchive')) {
+        $log[] = 'Cannot read XLSX upload: ZipArchive is not available on this server.';
+        return [];
+    }
+
+    $zip = new ZipArchive();
+    $opened = $zip->open($path);
+    if ($opened !== true) {
+        $log[] = 'Could not open uploaded XLSX file.';
+        return [];
+    }
+
+    $shared_strings = hostfully_mphb_extract_xlsx_shared_strings($zip);
+    $rows = [];
+
+    for ($i = 0; $i < $zip->numFiles; $i++) {
+        $sheet_path = $zip->getNameIndex($i);
+        if (!is_string($sheet_path) || !preg_match('#^xl/worksheets/[^/]+\.xml$#', $sheet_path)) continue;
+
+        $contents = $zip->getFromIndex($i);
+        if (!is_string($contents) || $contents === '') continue;
+
+        $sheet_xml = @simplexml_load_string($contents);
+        if (!$sheet_xml || !isset($sheet_xml->sheetData)) continue;
+
+        $hyperlinks = hostfully_mphb_extract_xlsx_hyperlink_map($zip, $sheet_path, $sheet_xml);
+
+        foreach ($sheet_xml->sheetData->row as $row_xml) {
+            $row_index = (string)$row_xml['r'];
+            $texts = [];
+            $urls = [];
+
+            foreach ($row_xml->c as $cell) {
+                $ref = (string)$cell['r'];
+                $text = trim(hostfully_mphb_extract_xlsx_cell_text($cell, $shared_strings));
+                if ($text !== '') {
+                    $texts[] = $text;
+                    $urls = array_merge($urls, hostfully_mphb_extract_ical_urls_from_text($text));
+                }
+                if ($ref !== '' && !empty($hyperlinks[$ref])) {
+                    $urls[] = $hyperlinks[$ref];
+                }
+            }
+
+            $row = hostfully_mphb_build_uploaded_ical_row($texts, $urls, basename($sheet_path) . ':' . $row_index);
+            if ($row && !empty($row['urls'])) $rows[] = $row;
+        }
+    }
+
+    $zip->close();
+    return hostfully_mphb_merge_uploaded_ical_rows($rows);
+}
+
+function hostfully_mphb_extract_ical_urls_from_uploaded_xlsx(string $path, array &$log): array
+{
+    if (!class_exists('ZipArchive')) {
+        $log[] = 'Cannot read XLSX upload: ZipArchive is not available on this server.';
+        return [];
+    }
+
+    $zip = new ZipArchive();
+    $opened = $zip->open($path);
+    if ($opened !== true) {
+        $log[] = 'Could not open uploaded XLSX file.';
+        return [];
+    }
+
+    $urls = [];
+    for ($i = 0; $i < $zip->numFiles; $i++) {
+        $name = $zip->getNameIndex($i);
+        if (!is_string($name) || !preg_match('/\.(xml|rels)$/i', $name)) continue;
+
+        $contents = $zip->getFromIndex($i);
+        if (!is_string($contents) || $contents === '') continue;
+
+        $urls = array_merge($urls, hostfully_mphb_extract_ical_urls_from_text($contents));
+    }
+
+    $zip->close();
+    return hostfully_mphb_dedupe_normalized_ical_urls($urls);
+}
+
+function hostfully_mphb_parse_uploaded_ical_allowlist(array $file, array &$log): array
+{
+    $tmp_name = isset($file['tmp_name']) && is_string($file['tmp_name']) ? $file['tmp_name'] : '';
+    $orig_name = isset($file['name']) && is_string($file['name']) ? $file['name'] : '';
+
+    if ($tmp_name === '' || !is_uploaded_file($tmp_name)) {
+        $log[] = 'Uploaded file was missing or invalid.';
+        return [];
+    }
+
+    $ext = strtolower((string)pathinfo($orig_name, PATHINFO_EXTENSION));
+    if ($ext === 'xlsx') {
+        $urls = hostfully_mphb_extract_ical_urls_from_uploaded_xlsx($tmp_name, $log);
+    } elseif (in_array($ext, ['csv', 'txt'], true)) {
+        $urls = hostfully_mphb_extract_ical_urls_from_uploaded_text_file($tmp_name);
+    } else {
+        $log[] = 'Unsupported file type: ' . ($ext !== '' ? $ext : 'unknown') . '. Use XLSX, CSV, or TXT.';
+        return [];
+    }
+
+    $urls = hostfully_mphb_dedupe_normalized_ical_urls($urls);
+    $log[] = 'Allowlist file parsed: found ' . count($urls) . ' unique URLs.';
+    return $urls;
+}
+
+function hostfully_mphb_parse_uploaded_ical_rows(array $file, array &$log): array
+{
+    $tmp_name = isset($file['tmp_name']) && is_string($file['tmp_name']) ? $file['tmp_name'] : '';
+    $orig_name = isset($file['name']) && is_string($file['name']) ? $file['name'] : '';
+
+    if ($tmp_name === '' || !is_uploaded_file($tmp_name)) {
+        $log[] = 'Uploaded file was missing or invalid.';
+        return [];
+    }
+
+    $ext = strtolower((string)pathinfo($orig_name, PATHINFO_EXTENSION));
+    if ($ext === 'xlsx') {
+        $rows = hostfully_mphb_parse_uploaded_ical_rows_from_xlsx($tmp_name, $log);
+    } elseif ($ext === 'csv') {
+        $rows = hostfully_mphb_parse_uploaded_ical_rows_from_csv($tmp_name);
+    } elseif ($ext === 'txt') {
+        $rows = hostfully_mphb_parse_uploaded_ical_rows_from_txt($tmp_name);
+    } else {
+        $log[] = 'Unsupported file type: ' . ($ext !== '' ? $ext : 'unknown') . '. Use XLSX, CSV, or TXT.';
+        return [];
+    }
+
+    $rows = hostfully_mphb_merge_uploaded_ical_rows($rows);
+    $log[] = 'Active property file parsed: found ' . count($rows) . ' row(s) with iCal URLs.';
+    return $rows;
+}
+
+function hostfully_mphb_get_imported_room_type_candidates(): array
+{
+    $posts = get_posts([
+        'post_type' => 'mphb_room_type',
+        'post_status' => ['publish', 'draft', 'pending', 'private', 'future'],
+        'posts_per_page' => -1,
+        'meta_key' => '_hostfully_property_uid',
+        'fields' => 'ids',
+        'orderby' => 'title',
+        'order' => 'ASC',
+    ]);
+
+    $candidates = [];
+    foreach ($posts as $post_id) {
+        $post_id = (int)$post_id;
+        if ($post_id < 1) continue;
+
+        $uid = trim((string)get_post_meta($post_id, '_hostfully_property_uid', true));
+        if ($uid === '') continue;
+
+        $title = trim((string)get_the_title($post_id));
+        $room_id = hostfully_mphb_find_existing_room_id($uid);
+        $room_title = $room_id > 0 ? trim((string)get_the_title($room_id)) : '';
+        $raw_property_name = trim((string)get_post_meta($post_id, '_hostfully_property_name', true));
+        $desc_name = trim((string)get_post_meta($post_id, '_hostfully_desc_name', true));
+        $address_line1 = trim((string)get_post_meta($post_id, '_hostfully_address_line1', true));
+        $short_summary = trim((string)get_post_meta($post_id, '_hostfully_desc_short_summary', true));
+        $summary = trim((string)get_post_meta($post_id, '_hostfully_desc_summary', true));
+
+        $aliases = [];
+        $candidate_titles = [$title, $room_title, $raw_property_name, $desc_name, $address_line1];
+        if ($address_line1 !== '') {
+            $address_without_number = preg_replace('/^\d+[A-Za-z]?\s+/u', '', $address_line1);
+            if (is_string($address_without_number) && $address_without_number !== '') {
+                $candidate_titles[] = $address_without_number;
+            }
+        }
+        foreach ([$short_summary, $summary] as $summary_text) {
+            foreach (hostfully_mphb_extract_match_alias_phrases($summary_text) as $phrase) {
+                $candidate_titles[] = $phrase;
+            }
+        }
+
+        foreach ($candidate_titles as $candidate_title) {
+            foreach (hostfully_mphb_build_match_title_variants($candidate_title) as $normalized) {
+                if ($normalized !== '') $aliases[$normalized] = true;
+            }
+        }
+
+        $candidate = [
+            'uid' => $uid,
+            'post_id' => $post_id,
+            'room_id' => $room_id,
+            'title' => $title,
+            'post_status' => (string)get_post_status($post_id),
+            'aliases' => array_keys($aliases),
+        ];
+
+        $existing = $candidates[$uid] ?? null;
+        if (!is_array($existing)) {
+            $candidates[$uid] = $candidate;
+            continue;
+        }
+
+        $existing_rank = hostfully_mphb_get_match_candidate_status_rank((string)($existing['post_status'] ?? ''));
+        $candidate_rank = hostfully_mphb_get_match_candidate_status_rank((string)($candidate['post_status'] ?? ''));
+
+        if ($candidate_rank > $existing_rank || ($candidate_rank === $existing_rank && $post_id > (int)($existing['post_id'] ?? 0))) {
+            $candidates[$uid] = $candidate;
+        }
+    }
+
+    return array_values($candidates);
+}
+
+function hostfully_mphb_match_uploaded_row_to_imported_property(array $row, array $candidates): array
+{
+    $row_variants = array_values(array_unique(array_filter(array_map('strval', (array)($row['normalized_variants'] ?? [])))));
+    $normalized = is_string($row['normalized_title'] ?? null) ? trim($row['normalized_title']) : '';
+    if ($normalized !== '' && !in_array($normalized, $row_variants, true)) {
+        array_unshift($row_variants, $normalized);
+    }
+
+    if (empty($row_variants)) {
+        return ['status' => 'missing_title', 'matches' => []];
+    }
+
+    $exact = [];
+    foreach ($candidates as $candidate) {
+        $best_exact_score = 0;
+        foreach ($row_variants as $row_variant) {
+            if ($row_variant === '') continue;
+            if (in_array($row_variant, (array)($candidate['aliases'] ?? []), true)) {
+                $best_exact_score = max($best_exact_score, strlen($row_variant));
+            }
+        }
+
+        if ($best_exact_score > 0) {
+            $candidate['match_score'] = $best_exact_score;
+            $exact[] = $candidate;
+        }
+    }
+
+    if (!empty($exact)) {
+        usort($exact, static function (array $left, array $right): int {
+            return ($right['match_score'] <=> $left['match_score']);
+        });
+
+        $top_score = (int)($exact[0]['match_score'] ?? 0);
+        $top_matches = array_values(array_filter($exact, static function (array $candidate) use ($top_score): bool {
+            return (int)($candidate['match_score'] ?? 0) === $top_score;
+        }));
+
+        if (count($top_matches) === 1) {
+            return ['status' => 'matched', 'matches' => [$top_matches[0]], 'method' => 'exact'];
+        }
+
+        return ['status' => 'ambiguous', 'matches' => $top_matches, 'method' => 'exact'];
+    }
+
+    $partial = [];
+    foreach ($candidates as $candidate) {
+        $best_partial_score = 0;
+        foreach ((array)($candidate['aliases'] ?? []) as $alias) {
+            if ($alias === '') continue;
+            foreach ($row_variants as $row_variant) {
+                if ($row_variant === '') continue;
+                $score = 0;
+                if (strpos($alias, $row_variant . ' ') === 0 || $alias === $row_variant) {
+                    $score = 90;
+                } elseif (strpos($row_variant, $alias . ' ') === 0 || $row_variant === $alias) {
+                    $score = 80;
+                } elseif (strpos($alias, $row_variant) !== false || strpos($row_variant, $alias) !== false) {
+                    $score = 70;
+                }
+
+                if ($score > $best_partial_score) {
+                    $best_partial_score = $score;
+                }
+            }
+        }
+
+        if ($best_partial_score > 0) {
+            $candidate['match_score'] = $best_partial_score;
+            $partial[] = $candidate;
+        }
+    }
+
+    if (!empty($partial)) {
+        usort($partial, static function (array $left, array $right): int {
+            return ($right['match_score'] <=> $left['match_score']);
+        });
+
+        $top_score = (int)($partial[0]['match_score'] ?? 0);
+        $top_matches = array_values(array_filter($partial, static function (array $candidate) use ($top_score): bool {
+            return (int)($candidate['match_score'] ?? 0) === $top_score;
+        }));
+
+        if (count($top_matches) === 1) {
+            return ['status' => 'matched', 'matches' => [$top_matches[0]], 'method' => 'partial'];
+        }
+
+        return ['status' => 'ambiguous', 'matches' => $top_matches, 'method' => 'partial'];
+    }
+
+    $fuzzy = [];
+    foreach ($candidates as $candidate) {
+        $best_score = 0.0;
+        foreach ($row_variants as $row_variant) {
+            if (strlen($row_variant) < 10) continue;
+            foreach ((array)($candidate['aliases'] ?? []) as $alias) {
+                if ($alias === '') continue;
+                similar_text($row_variant, $alias, $score);
+                if ($score > $best_score) {
+                    $best_score = $score;
+                }
+            }
+        }
+
+        if ($best_score >= 88.0) {
+            $candidate['match_score'] = $best_score;
+            $fuzzy[] = $candidate;
+        }
+    }
+
+    if (!empty($fuzzy)) {
+        usort($fuzzy, static function (array $left, array $right): int {
+            return ($right['match_score'] <=> $left['match_score']);
+        });
+
+        $top_score = (float)($fuzzy[0]['match_score'] ?? 0.0);
+        $top_matches = array_values(array_filter($fuzzy, static function (array $candidate) use ($top_score): bool {
+            return ((float)($candidate['match_score'] ?? 0.0)) >= ($top_score - 2.0);
+        }));
+
+        if (count($top_matches) === 1) {
+            return ['status' => 'matched', 'matches' => [$top_matches[0]], 'method' => 'fuzzy'];
+        }
+
+        return ['status' => 'ambiguous', 'matches' => $top_matches, 'method' => 'fuzzy'];
+    }
+
+    return ['status' => 'unmatched', 'matches' => []];
+}
+
+function hostfully_mphb_apply_uploaded_ical_urls_to_room(int $room_id, array $urls, array &$log): array
+{
+    $urls = hostfully_mphb_dedupe_normalized_ical_urls($urls);
+    if ($room_id < 1 || empty($urls)) {
+        return ['ok' => false, 'linked_count' => 0, 'status' => 'Missing room or URLs'];
+    }
+
+    if (!function_exists('MPHB')) {
+        return ['ok' => false, 'linked_count' => 0, 'status' => 'MotoPress Hotel Booking not available'];
+    }
+
+    try {
+        $room = MPHB()->getRoomRepository()->findById($room_id);
+        if (!$room) {
+            return ['ok' => false, 'linked_count' => 0, 'status' => 'Room not found'];
+        }
+
+        $room->setSyncUrls($urls);
+        $log[] = 'Active property file: set ' . count($urls) . ' iCal URL(s) on room ' . $room_id . '.';
+
+        return ['ok' => true, 'linked_count' => count($urls), 'status' => 'Linked uploaded iCal URL(s)'];
+    } catch (Throwable $e) {
+        $log[] = 'Active property file: failed to link room ' . $room_id . ': ' . $e->getMessage();
+        return ['ok' => false, 'linked_count' => 0, 'status' => 'Error: ' . $e->getMessage()];
+    }
+}
+
+function hostfully_mphb_get_ical_allowlist_job_key(string $job_token): string
+{
+    return 'hostfully_mphb_ical_allowlist_' . md5($job_token);
+}
+
+function hostfully_mphb_collect_ical_urls_from_items(array $icals): array
+{
+    $urls = [];
+
+    foreach ($icals as $ical) {
+        if (!is_array($ical)) continue;
+        foreach (['url', 'icalUrl', 'importUrl', 'exportUrl', 'link'] as $key) {
+            if (!empty($ical[$key]) && is_string($ical[$key])) {
+                $urls[] = $ical[$key];
+            }
+        }
+    }
+
+    return hostfully_mphb_dedupe_normalized_ical_urls($urls);
+}
+
+function hostfully_mphb_get_room_export_ical_url(int $room_id): string
+{
+    if ($room_id < 1) return '';
+
+    return add_query_arg([
+        'feed' => 'mphb.ics',
+        'accommodation_id' => $room_id,
+    ], site_url('/'));
+}
+
+function hostfully_mphb_prepare_export_csv_text(string $text): string
+{
+    $text = html_entity_decode($text, ENT_QUOTES, 'UTF-8');
+    $text = wp_strip_all_tags($text);
+    $text = preg_replace('/\s+/u', ' ', $text);
+
+    return is_string($text) ? trim($text) : '';
+}
+
+function hostfully_mphb_get_imported_property_ical_export_rows(array &$log): array
+{
+    $rows = [];
+    $candidates = hostfully_mphb_get_imported_room_type_candidates();
+
+    foreach ($candidates as $candidate) {
+        if (!is_array($candidate)) continue;
+
+        $uid = isset($candidate['uid']) ? trim((string)$candidate['uid']) : '';
+        $post_id = isset($candidate['post_id']) ? (int)$candidate['post_id'] : 0;
+        $room_id = isset($candidate['room_id']) ? (int)$candidate['room_id'] : 0;
+
+        if ($uid === '' || $post_id < 1) continue;
+
+        $property_name = hostfully_mphb_prepare_export_csv_text((string)($candidate['title'] ?? ''));
+        $property_status = (string)($candidate['post_status'] ?? '');
+        $property_url = '';
+        if ($property_status === 'publish') {
+            $permalink = get_permalink($post_id);
+            if (is_string($permalink) && $permalink !== '') {
+                $property_url = $permalink;
+            }
+        }
+
+        $property_admin_url = '';
+        $edit_link = get_edit_post_link($post_id, '');
+        if (is_string($edit_link) && $edit_link !== '') {
+            $property_admin_url = $edit_link;
+        }
+
+        $room_name = $room_id > 0 ? hostfully_mphb_prepare_export_csv_text((string)get_the_title($room_id)) : '';
+
+        $import_urls = [];
+        if ($room_id > 0 && function_exists('MPHB')) {
+            $sync_urls = MPHB()->getSyncUrlsRepository()->getUrls($room_id);
+            $import_urls = is_array($sync_urls)
+                ? hostfully_mphb_dedupe_normalized_ical_urls(array_values($sync_urls))
+                : [];
+        }
+
+        $notes = [];
+        if ($property_status !== 'publish') {
+            $notes[] = 'Property is not publicly published';
+        }
+        if ($room_id < 1) {
+            $notes[] = 'No MotoPress room linked yet';
+        }
+        if ($room_id > 0 && empty($import_urls)) {
+            $notes[] = 'No external import iCal URLs stored';
+        }
+
+        $rows[] = [
+            'uid' => $uid,
+            'property_name' => $property_name,
+            'property_status' => $property_status,
+            'property_url' => $property_url,
+            'property_admin_url' => $property_admin_url,
+            'room_id' => $room_id,
+            'room_name' => $room_name,
+            'wp_export_url' => hostfully_mphb_get_room_export_ical_url($room_id),
+            'wp_import_urls' => $import_urls,
+            'notes' => implode('; ', $notes),
+        ];
+    }
+
+    usort($rows, static function (array $left, array $right): int {
+        return strcasecmp((string)($left['property_name'] ?? ''), (string)($right['property_name'] ?? ''));
+    });
+
+    $log[] = 'Prepared property iCal export for ' . count($rows) . ' imported properties.';
+
+    return $rows;
 }
 
 function hostfully_mphb_fetch_property_detail(string $property_uid, array &$log, int &$http_status = 0): array
@@ -2982,11 +3896,13 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     }
 
     $desc = hostfully_mphb_fetch_property_descriptions($property_uid, $log);
+    $raw_property_name = trim((string)($property['name'] ?? ''));
+    $desc_name = trim((string)($desc['name'] ?? ''));
 
     // 2) Create or update room type
     $title = '';
-    if (!empty($desc['name'])) $title = $desc['name'];
-    if ($title === '' && !empty($property['name'])) $title = $property['name'];
+    if ($desc_name !== '') $title = $desc_name;
+    if ($title === '' && $raw_property_name !== '') $title = $raw_property_name;
     if ($title === '') $title = 'Imported Property';
 
     $post_args = [
@@ -3012,6 +3928,8 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     $log[] = ($existing_post_id ? 'Updated' : 'Created') . ' accommodation type OK: ' . (int)$post_id;
 
     update_post_meta($post_id, '_hostfully_property_uid', $property['uid']);
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_property_name', $raw_property_name);
+    hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_name', $desc_name);
 
     // 3) Core meta
     $guests = hostfully_mphb_extract_guest_counts($property);
@@ -3704,6 +4622,90 @@ function hostfully_mphb_sync_property_fees_for_imports(int $offset, int $batch_s
     ];
 }
 
+function hostfully_mphb_sync_property_name_aliases_for_imports(int $offset, int $batch_size, array &$log): array
+{
+    $posts = get_posts([
+        'post_type'      => 'mphb_room_type',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'meta_query'     => [
+            [
+                'key'     => '_hostfully_property_uid',
+                'compare' => 'EXISTS',
+            ],
+        ],
+        'fields' => 'ids',
+    ]);
+
+    $total = count($posts);
+    if ($offset < 0) $offset = 0;
+    if ($batch_size < 1) $batch_size = 10;
+    $posts = array_slice($posts, $offset, $batch_size);
+
+    $processed = 0;
+    $updated = 0;
+    $skipped = 0;
+    $errors = 0;
+
+    foreach ($posts as $post_id) {
+        $post_id = (int)$post_id;
+        $processed++;
+
+        $property_uid = trim((string)get_post_meta($post_id, '_hostfully_property_uid', true));
+        if ($property_uid === '') {
+            $skipped++;
+            continue;
+        }
+
+        $detail_status = 0;
+        $property = hostfully_mphb_fetch_property_detail($property_uid, $log, $detail_status);
+        if (empty($property) || !is_array($property)) {
+            if ($detail_status === 404) {
+                if (hostfully_mphb_mark_property_stale($post_id, $property_uid, $log, 'Name alias sync')) {
+                    $skipped++;
+                } else {
+                    $errors++;
+                }
+            } else {
+                $errors++;
+            }
+            $log[] = 'Name alias sync failed to fetch property detail for UID ' . $property_uid . '.';
+            continue;
+        }
+
+        $desc = hostfully_mphb_fetch_property_descriptions($property_uid, $log);
+        $raw_property_name = trim((string)($property['name'] ?? ''));
+        $desc_name = trim((string)($desc['name'] ?? ''));
+
+        $existing_raw = trim((string)get_post_meta($post_id, '_hostfully_property_name', true));
+        $existing_desc = trim((string)get_post_meta($post_id, '_hostfully_desc_name', true));
+
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_property_name', $raw_property_name);
+        hostfully_mphb_update_text_meta($post_id, '_hostfully_desc_name', $desc_name);
+
+        if ($existing_raw !== $raw_property_name || $existing_desc !== $desc_name) {
+            $updated++;
+        } else {
+            $skipped++;
+        }
+    }
+
+    $log[] = 'Name alias sync batch: processed ' . $processed . ', updated ' . $updated . ', skipped ' . $skipped . ', errors ' . $errors . '.';
+
+    $next_offset = $offset + $processed;
+
+    return [
+        'processed' => $processed,
+        'offset' => $offset,
+        'next_offset' => $next_offset,
+        'total' => $total,
+        'done' => $next_offset >= $total,
+        'updated' => $updated,
+        'skipped' => $skipped,
+        'errors' => $errors,
+    ];
+}
+
 function hostfully_mphb_unpublish_missing_properties(array &$log): int
 {
     $hostfully = hostfully_mphb_get_properties_with_log($log);
@@ -3987,6 +4989,7 @@ function hostfully_mphb_render_admin()
                     <p>
                         <button id="hostfully-sync-property-fees" class="button" title="Refresh per-property cleaning fees, security deposits, native extra guest pricing, and stale-property drafting without running a full post-import sync.">Sync Property Fees</button>
                         <button id="hostfully-sync-guest-capacity" class="button" style="margin-left:8px;" title="Reapply guests-only capacity values to imported accommodations without touching pricing or fees.">Sync Guest Capacity</button>
+                        <button id="hostfully-sync-name-aliases" class="button" style="margin-left:8px;" title="Backfill raw Hostfully property names and description names on existing imports so spreadsheet matching works without rerunning the full bulk importer.">Sync Name Aliases</button>
                         <button id="hostfully-cleanup-terms" class="button" style="margin-left:8px;" title="Remove unused taxonomy terms and delete orphaned importer artifacts such as rates, rooms, services, media, and stale attribute-registry entries.">Run Cleanup</button>
                     </p>
                     <p class="description" style="margin:6px 0 0; max-width:900px;">Use these only when you need one specific maintenance action. For routine operations, prefer the main Post-Import Sync. Cleanup is best reserved for housekeeping after significant import changes or removals.</p>
@@ -3995,6 +4998,26 @@ function hostfully_mphb_render_admin()
                 <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
                     <h2 style="margin:0 0 8px; font-size:16px;">iCal Tools</h2>
                     <p style="margin-top:0;">These are only needed for channel-calendar audits and linking external feeds into MotoPress.</p>
+                    <p>
+                        <button id="hostfully-ical-export-csv" class="button" title="Download all imported properties with their current WordPress iCal import URLs and WordPress iCal export URL.">Download Property iCal CSV</button>
+                        <span id="hostfully-ical-export-status" style="margin-left:8px; color:#666;"></span>
+                        <span id="hostfully-ical-export-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                    </p>
+                    <p class="description" style="margin:0 0 12px; max-width:900px;">Exports the current WordPress iCal setup for each imported property so the client can paste the WordPress export URL into Airbnb and keep a record of the import URLs already stored in MotoPress.</p>
+                    <div style="background:#f6f7f7; border:1px solid #dcdcde; padding:12px; margin:0 0 12px;">
+                        <h3 style="margin:0 0 8px; font-size:15px;">Active Property File</h3>
+                        <p style="margin-top:0; max-width:900px;">Upload the client’s XLSX, CSV, or TXT file of active properties. The importer reads each row’s title and iCal URL, matches the title against existing imported accommodation titles in WordPress, writes the uploaded iCal URL into the matching MotoPress accommodation unit, and then drafts imported properties that are not present on the uploaded active list.</p>
+                        <p>
+                            <input id="hostfully-ical-allowlist-file" type="file" accept=".xlsx,.csv,.txt" title="Upload the client file containing active-property iCal links.">
+                            <button id="hostfully-ical-allowlist-run" class="button button-secondary" style="margin-left:8px;" title="Match uploaded titles to imported WordPress accommodations, write the uploaded iCal URLs, and draft imported properties that are not on the active list when every row matches safely.">Apply Active Property File</button>
+                            <span id="hostfully-ical-allowlist-status" style="margin-left:8px; color:#666;"></span>
+                            <span id="hostfully-ical-allowlist-spinner" class="spinner" style="float:none; vertical-align:middle; margin-left:6px;"></span>
+                        </p>
+                        <p class="description" style="margin:0 0 10px; max-width:900px;">Safety: this never hard-deletes properties. It only changes unmatched imported properties to Draft. Drafting is blocked automatically if any uploaded active row is ambiguous, unmatched, or missing a usable title.</p>
+                        <div id="hostfully-ical-allowlist-table" style="margin-top:10px;"></div>
+                        <pre id="hostfully-ical-allowlist-log" style="white-space:pre-wrap; margin-top:10px; display:none; background:#fff; border:1px solid #ccc; padding:10px; max-width:900px;"></pre>
+                    </div>
+                    <hr>
                     <p>
                         <label for="hostfully-ical-report-limit" style="margin-right:8px;">Max properties to scan</label>
                         <input id="hostfully-ical-report-limit" type="number" min="1" max="200" value="50" style="width:120px;" title="Limit how many properties the iCal audit scans in one run.">
@@ -4510,16 +5533,7 @@ add_action('wp_ajax_hostfully_mphb_ical_report', function () {
         }
         $channels = array_values(array_unique(array_filter($channels)));
 
-        $ical_urls = [];
-        foreach ($icals as $ical) {
-            if (!is_array($ical)) continue;
-            foreach (['url', 'icalUrl', 'importUrl', 'exportUrl', 'link'] as $key) {
-                if (!empty($ical[$key]) && is_string($ical[$key])) {
-                    $ical_urls[] = $ical[$key];
-                }
-            }
-        }
-        $ical_urls = array_values(array_unique(array_filter($ical_urls)));
+        $ical_urls = hostfully_mphb_collect_ical_urls_from_items($icals);
 
         $items[] = [
             'uid' => $uid,
@@ -4539,6 +5553,202 @@ add_action('wp_ajax_hostfully_mphb_ical_report', function () {
         'total' => $total,
         'next_offset' => $next_offset,
         'done' => $next_offset >= $total,
+        'log' => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_apply_ical_allowlist', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+    $log = [];
+
+    if (empty($_FILES['allowlist_file']) || !is_array($_FILES['allowlist_file'])) {
+        wp_send_json_error(['message' => 'Upload an XLSX, CSV, or TXT file first.'], 400);
+    }
+
+    $rows = hostfully_mphb_parse_uploaded_ical_rows($_FILES['allowlist_file'], $log);
+    if (empty($rows)) {
+        wp_send_json_error([
+            'message' => 'No rows with titles and iCal URLs were found in the uploaded file.',
+            'log' => $log,
+        ], 400);
+    }
+
+    $candidates = hostfully_mphb_get_imported_room_type_candidates();
+    if (empty($candidates)) {
+        wp_send_json_error([
+            'message' => 'No imported MotoPress accommodations were found to match against.',
+            'log' => $log,
+        ], 400);
+    }
+
+    $items = [];
+    $active_uids = [];
+    $matched_rows = 0;
+    $linked_rooms = 0;
+    $ambiguous_rows = 0;
+    $unmatched_rows = 0;
+    $missing_title_rows = 0;
+    $unmatched_titles = [];
+    $ambiguous_titles = [];
+    $matched_groups = [];
+
+    foreach ($rows as $row) {
+        $match = hostfully_mphb_match_uploaded_row_to_imported_property($row, $candidates);
+        $title = (string)($row['title'] ?? '');
+        $urls = hostfully_mphb_dedupe_normalized_ical_urls((array)($row['urls'] ?? []));
+
+        if ($match['status'] === 'matched' && !empty($match['matches'][0])) {
+            $candidate = $match['matches'][0];
+            $uid = (string)($candidate['uid'] ?? '');
+            $post_id = (int)($candidate['post_id'] ?? 0);
+            $room_id = (int)($candidate['room_id'] ?? 0);
+            $room_type_title = (string)($candidate['title'] ?? '');
+            $active_uids[$uid] = true;
+            $matched_rows++;
+
+            $group_key = $uid !== '' ? 'uid:' . $uid : 'room:' . $room_id;
+            if (!isset($matched_groups[$group_key])) {
+                $matched_groups[$group_key] = [
+                    'uid' => $uid,
+                    'post_id' => $post_id,
+                    'room_id' => $room_id,
+                    'room_type_title' => $room_type_title,
+                    'urls' => [],
+                    'item_indexes' => [],
+                    'row_count' => 0,
+                ];
+            }
+
+            $matched_groups[$group_key]['urls'] = hostfully_mphb_dedupe_normalized_ical_urls(array_merge(
+                (array)$matched_groups[$group_key]['urls'],
+                $urls
+            ));
+            $matched_groups[$group_key]['row_count']++;
+
+            $items[] = [
+                'sheet_title' => $title,
+                'matched_title' => $room_type_title,
+                'uid' => $uid,
+                'post_id' => $post_id,
+                'room_id' => $room_id,
+                'ical_count' => count($urls),
+                'linked_count' => 0,
+                'status' => 'Queued for linking',
+                'match_method' => (string)($match['method'] ?? 'exact'),
+            ];
+            $matched_groups[$group_key]['item_indexes'][] = count($items) - 1;
+            continue;
+        }
+
+        if ($match['status'] === 'ambiguous') {
+            $ambiguous_rows++;
+            $ambiguous_titles[] = $title;
+            $items[] = [
+                'sheet_title' => $title,
+                'matched_title' => implode(' | ', array_map(function ($candidate) {
+                    return (string)($candidate['title'] ?? '');
+                }, (array)$match['matches'])),
+                'uid' => '',
+                'post_id' => 0,
+                'room_id' => 0,
+                'ical_count' => count($urls),
+                'linked_count' => 0,
+                'status' => 'Ambiguous title match',
+                'match_method' => (string)($match['method'] ?? 'exact'),
+            ];
+            continue;
+        }
+
+        if ($match['status'] === 'missing_title') {
+            $missing_title_rows++;
+            $items[] = [
+                'sheet_title' => '(missing title)',
+                'matched_title' => '',
+                'uid' => '',
+                'post_id' => 0,
+                'room_id' => 0,
+                'ical_count' => count($urls),
+                'linked_count' => 0,
+                'status' => 'Row had URL(s) but no usable title',
+                'match_method' => '',
+            ];
+            continue;
+        }
+
+        $unmatched_rows++;
+        $unmatched_titles[] = $title;
+        $items[] = [
+            'sheet_title' => $title,
+            'matched_title' => '',
+            'uid' => '',
+            'post_id' => 0,
+            'room_id' => 0,
+            'ical_count' => count($urls),
+            'linked_count' => 0,
+            'status' => 'No WordPress title match',
+            'match_method' => '',
+        ];
+    }
+
+    foreach ($matched_groups as $group) {
+        $group_urls = hostfully_mphb_dedupe_normalized_ical_urls((array)($group['urls'] ?? []));
+        $group_row_count = (int)($group['row_count'] ?? 0);
+        $group_room_id = (int)($group['room_id'] ?? 0);
+
+        if ($group_row_count > 1) {
+            $log[] = 'Active property file: merged ' . $group_row_count . ' uploaded rows for room ' . $group_room_id . ' before linking.';
+        }
+
+        $link_result = hostfully_mphb_apply_uploaded_ical_urls_to_room($group_room_id, $group_urls, $log);
+        if (!empty($link_result['ok'])) {
+            $linked_rooms++;
+        }
+
+        foreach ((array)($group['item_indexes'] ?? []) as $item_index) {
+            if (!isset($items[$item_index])) continue;
+            $items[$item_index]['linked_count'] = (int)($link_result['linked_count'] ?? 0);
+            $items[$item_index]['status'] = (string)($link_result['status'] ?? 'Matched');
+        }
+    }
+
+    $drafted = 0;
+    $draft_candidates = 0;
+    $safety_stop = ($matched_rows === 0 || $ambiguous_rows > 0 || $missing_title_rows > 0);
+
+    if ($safety_stop) {
+        $log[] = 'Safety stop: no imported properties were drafted because there were ambiguous matches, missing titles, or no successful matches at all.';
+    } else {
+        if ($unmatched_rows > 0) {
+            $log[] = 'Warning: ' . $unmatched_rows . ' uploaded row(s) did not match any imported WordPress property. Drafting continued for imported properties only.';
+        }
+        $uid_map = hostfully_mphb_get_imported_uid_map();
+        foreach ($uid_map as $uid => $post_id) {
+            if (isset($active_uids[$uid])) continue;
+            $draft_candidates++;
+            if (hostfully_mphb_mark_property_stale((int)$post_id, $uid, $log, 'Active property file')) {
+                $drafted++;
+            }
+        }
+        $log[] = 'Active property file applied: drafted ' . $drafted . ' imported properties not present on the uploaded list.';
+    }
+
+    wp_send_json_success([
+        'items' => $items,
+        'count' => count($items),
+        'total' => count($rows),
+        'next_offset' => count($rows),
+        'done' => true,
+        'matched_rows' => $matched_rows,
+        'linked_rooms' => $linked_rooms,
+        'ambiguous_rows' => $ambiguous_rows,
+        'unmatched_rows' => $unmatched_rows,
+        'missing_title_rows' => $missing_title_rows,
+        'unmatched_titles_preview' => array_slice(array_values(array_unique(array_filter($unmatched_titles))), 0, 20),
+        'ambiguous_titles_preview' => array_slice(array_values(array_unique(array_filter($ambiguous_titles))), 0, 20),
+        'draft_candidates' => $draft_candidates,
+        'drafted' => $drafted,
+        'safety_stop' => $safety_stop,
         'log' => $log,
     ]);
 });
@@ -4599,16 +5809,7 @@ add_action('wp_ajax_hostfully_mphb_link_icals', function () {
         $name = (string)($p['name'] ?? 'Unnamed property');
 
         $icals = hostfully_mphb_fetch_property_icals($uid, $log);
-        $ical_urls = [];
-        foreach ($icals as $ical) {
-            if (!is_array($ical)) continue;
-            foreach (['url', 'icalUrl', 'importUrl', 'exportUrl', 'link'] as $key) {
-                if (!empty($ical[$key]) && is_string($ical[$key])) {
-                    $ical_urls[] = $ical[$key];
-                }
-            }
-        }
-        $ical_urls = array_values(array_unique(array_filter($ical_urls)));
+        $ical_urls = hostfully_mphb_collect_ical_urls_from_items($icals);
 
         if (empty($ical_urls)) {
             $no_icals++;
@@ -4726,6 +5927,20 @@ add_action('wp_ajax_hostfully_mphb_link_icals', function () {
     ]);
 });
 
+add_action('wp_ajax_hostfully_mphb_export_property_icals', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $log = [];
+    $items = hostfully_mphb_get_imported_property_ical_export_rows($log);
+
+    wp_send_json_success([
+        'items' => $items,
+        'count' => count($items),
+        'log' => $log,
+    ]);
+});
+
 add_action('wp_ajax_hostfully_mphb_cleanup_terms', function () {
     if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
     check_ajax_referer('hostfully_mphb_ajax', 'nonce');
@@ -4799,6 +6014,21 @@ add_action('wp_ajax_hostfully_mphb_sync_property_fees', function () {
     $batch_size = isset($_POST['batch_size']) ? max(1, (int)$_POST['batch_size']) : 10;
     $log = [];
     $res = hostfully_mphb_sync_property_fees_for_imports($offset, $batch_size, $log);
+
+    wp_send_json_success([
+        'result' => $res,
+        'log'    => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_sync_property_name_aliases', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $offset = isset($_POST['offset']) ? max(0, (int)$_POST['offset']) : 0;
+    $batch_size = isset($_POST['batch_size']) ? max(1, (int)$_POST['batch_size']) : 10;
+    $log = [];
+    $res = hostfully_mphb_sync_property_name_aliases_for_imports($offset, $batch_size, $log);
 
     wp_send_json_success([
         'result' => $res,
