@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer
  * Description: Sync Hostfully properties into MotoPress with update-safe reimports.
- * Version: 0.41
+ * Version: 0.42
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -4553,6 +4553,20 @@ function hostfully_mphb_get_featured_reference_ids(): array
         $gallery_ids = array_filter(array_map('intval', explode(',', (string)$gallery_value)));
         foreach ($gallery_ids as $gallery_id) {
             $referenced[(int)$gallery_id] = true;
+        }
+    }
+
+    $elementor_blobs = $wpdb->get_col(
+        "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key IN ('_elementor_data', '_elementor_page_settings') AND meta_value <> ''"
+    );
+    foreach ((array)$elementor_blobs as $blob) {
+        if (!is_string($blob) || $blob === '') continue;
+        if (!preg_match_all('/\"id\"\s*:\s*(\d+)/', $blob, $matches)) continue;
+        foreach ((array)($matches[1] ?? []) as $elementor_id) {
+            $elementor_id = (int)$elementor_id;
+            if ($elementor_id > 0) {
+                $referenced[$elementor_id] = true;
+            }
         }
     }
 
