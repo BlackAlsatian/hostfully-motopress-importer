@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer
  * Description: Sync Hostfully properties into MotoPress with update-safe reimports.
- * Version: 0.43
+ * Version: 0.44
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -4094,10 +4094,13 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
                 update_post_meta($post_id, '_hostfully_featured_src', $src_key);
 
                 if ($existing_id > 0 && $existing_id !== $attach_id && get_post_type($existing_id) === 'attachment') {
-                    $reference_snapshot = hostfully_mphb_get_featured_reference_snapshot(true);
-                    if (!hostfully_mphb_attachment_is_referenced($existing_id, $reference_snapshot)) {
-                        wp_delete_attachment($existing_id, false);
-                        $log[] = 'Featured replaced: trashed superseded attachment ' . $existing_id;
+                    $reference_snapshot = hostfully_mphb_get_safe_featured_reference_snapshot($log, true);
+                    if ($reference_snapshot === null) {
+                        $log[] = 'Featured replaced: kept attachment ' . $existing_id . ' (reference snapshot safety abort)';
+                    } elseif (!hostfully_mphb_attachment_is_referenced($existing_id, $reference_snapshot)) {
+                        if (hostfully_mphb_trash_attachment($existing_id, $log, 'Featured replaced')) {
+                            $log[] = 'Featured replaced: trashed superseded attachment ' . $existing_id;
+                        }
                     } else {
                         $log[] = 'Featured replaced: kept attachment ' . $existing_id . ' (still referenced elsewhere)';
                     }
@@ -4474,19 +4477,34 @@ function hostfully_mphb_cleanup_orphan_media(array &$log): int
         'fields' => 'ids',
     ]);
 
-    $deleted = 0;
+    $reference_snapshot = hostfully_mphb_get_safe_featured_reference_snapshot($log, true);
+    if ($reference_snapshot === null) {
+        $log[] = 'Cleanup orphan media: aborted.';
+        return 0;
+    }
+
+    $trashed = 0;
     foreach ($attachments as $attach_id) {
+        $attach_id = (int)$attach_id;
+        if ($attach_id < 1) continue;
+
         $parent_id = (int)get_post_field('post_parent', $attach_id);
         if ($parent_id === 0) continue;
         $parent = get_post($parent_id);
         if (!$parent || $parent->post_type !== 'mphb_room_type') {
-            wp_delete_attachment((int)$attach_id, true);
-            $deleted++;
+            if (hostfully_mphb_attachment_is_referenced($attach_id, $reference_snapshot)) {
+                $log[] = 'Cleanup orphan media: kept attachment ' . $attach_id . ' (still referenced elsewhere)';
+                continue;
+            }
+
+            if (hostfully_mphb_trash_attachment($attach_id, $log, 'Cleanup orphan media')) {
+                $trashed++;
+            }
         }
     }
 
-    $log[] = 'Cleanup orphan media: deleted ' . $deleted . '.';
-    return $deleted;
+    $log[] = 'Cleanup orphan media: trashed ' . $trashed . '.';
+    return $trashed;
 }
 
 function hostfully_mphb_format_bytes(int $bytes): string
@@ -4661,6 +4679,22 @@ function hostfully_mphb_get_featured_reference_snapshot(bool $refresh = false): 
     return $snapshot;
 }
 
+function hostfully_mphb_get_safe_featured_reference_snapshot(array &$log, bool $refresh = false): ?array
+{
+    $snapshot = hostfully_mphb_get_featured_reference_snapshot($refresh);
+    $referenced = is_array($snapshot['ids'] ?? null) ? $snapshot['ids'] : [];
+    $counts = wp_count_posts('mphb_room_type');
+    $publish_count = is_object($counts) ? (int)($counts->publish ?? 0) : 0;
+    $expected_floor = max(10, $publish_count);
+
+    if (count($referenced) < $expected_floor) {
+        $log[] = 'ABORT: reference set implausibly small (' . count($referenced) . ' < ' . $expected_floor . '). Refusing to classify orphans.';
+        return null;
+    }
+
+    return $snapshot;
+}
+
 function hostfully_mphb_get_featured_reference_ids(): array
 {
     $snapshot = hostfully_mphb_get_featured_reference_snapshot();
@@ -4721,6 +4755,23 @@ function hostfully_mphb_attachment_is_referenced(int $attach_id, ?array $snapsho
     return false;
 }
 
+function hostfully_mphb_trash_attachment(int $attach_id, array &$log, string $context): bool
+{
+    if ($attach_id < 1 || get_post_type($attach_id) !== 'attachment') {
+        $log[] = $context . ': skip invalid attachment ' . $attach_id . '.';
+        return false;
+    }
+
+    $trashed = wp_trash_post($attach_id);
+    if (!$trashed || is_wp_error($trashed)) {
+        $message = is_wp_error($trashed) ? $trashed->get_error_message() : 'trash failed';
+        $log[] = $context . ': could not trash attachment ' . $attach_id . ' (' . $message . ')';
+        return false;
+    }
+
+    return true;
+}
+
 function hostfully_mphb_get_featured_attachment_batch_ids(int $after_id, int $limit): array
 {
     global $wpdb;
@@ -4750,14 +4801,8 @@ function hostfully_mphb_get_featured_attachment_batch_ids(int $after_id, int $li
 
 function hostfully_mphb_get_featured_orphan_scan(int $after_id, array &$log, int $limit = 200, bool $refresh_refs = false): array
 {
-    $reference_snapshot = hostfully_mphb_get_featured_reference_snapshot($refresh_refs);
-    $referenced = is_array($reference_snapshot['ids'] ?? null) ? $reference_snapshot['ids'] : [];
-    $counts = wp_count_posts('mphb_room_type');
-    $publish_count = is_object($counts) ? (int)($counts->publish ?? 0) : 0;
-    $expected_floor = max(10, $publish_count);
-
-    if (count($referenced) < $expected_floor) {
-        $log[] = 'ABORT: reference set implausibly small (' . count($referenced) . ' < ' . $expected_floor . '). Refusing to classify orphans.';
+    $reference_snapshot = hostfully_mphb_get_safe_featured_reference_snapshot($log, $refresh_refs);
+    if ($reference_snapshot === null) {
         return [
             'items' => [],
             'count' => 0,
@@ -4828,7 +4873,7 @@ function hostfully_mphb_cleanup_featured_orphans(bool $delete, int $after_id, in
     foreach ($scan['items'] as $item) {
         $attach_id = (int)($item['id'] ?? 0);
         if ($attach_id < 1) continue;
-        if (wp_delete_attachment($attach_id, false)) {
+        if (hostfully_mphb_trash_attachment($attach_id, $log, 'Featured orphan cleanup batch')) {
             $deleted++;
         }
     }
