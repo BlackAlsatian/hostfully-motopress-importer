@@ -140,6 +140,22 @@
     }, 3500);
   }
 
+  function formatBytes(bytes) {
+    const value = Number(bytes) || 0;
+    if (value <= 0) return '0 B';
+
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = value;
+    let unitIndex = 0;
+
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+
+    return `${size.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+  }
+
   function setLoadPropertiesBusy(isBusy) {
     if (!loadPropertiesSpinner) return;
     if (isBusy) {
@@ -1237,48 +1253,85 @@
     logEl.textContent = '';
     setBusy(true);
     resetCounter();
-    statusEl.textContent = deleteItems ? 'Deleting featured orphans…' : 'Auditing featured orphans…';
+    statusEl.textContent = deleteItems ? 'Trashing featured orphans…' : 'Auditing featured orphans…';
 
     if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = true;
     if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = true;
 
-    let r = null;
-    try {
-      r = await post('hostfully_mphb_cleanup_featured_orphans', {
-        delete: deleteItems ? '1' : '0',
-      });
-      if (r && r.success) markJsOk();
-    } catch (err) {
-      showError(deleteItems ? 'Featured orphan cleanup failed' : 'Featured orphan audit failed', err);
-      if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
-      if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
-      return;
+    let afterId = 0;
+    let totalCount = 0;
+    let totalBytes = 0;
+    let totalDeleted = 0;
+    let totalScanned = 0;
+    let done = false;
+    let batch = 0;
+    let aborted = false;
+
+    while (!done) {
+      let r = null;
+      try {
+        r = await post('hostfully_mphb_cleanup_featured_orphans', {
+          delete: deleteItems ? '1' : '0',
+          after_id: String(afterId),
+          limit: '200',
+          refresh_refs: batch === 0 ? '1' : '0',
+        });
+        if (r && r.success) markJsOk();
+      } catch (err) {
+        showError(deleteItems ? 'Featured orphan cleanup failed' : 'Featured orphan audit failed', err);
+        if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
+        if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
+        return;
+      }
+
+      if (!r || !r.success) {
+        statusEl.textContent = deleteItems ? 'Featured orphan cleanup error' : 'Featured orphan audit error';
+        setBusy(false);
+        appendLog(['Featured orphan action failed.', JSON.stringify(r)]);
+        if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
+        if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
+        return;
+      }
+
+      const d = r.data || {};
+      const result = d.result || {};
+      appendLog([...(d.log || [])]);
+
+      totalCount += Number.isFinite(result.count) ? result.count : 0;
+      totalBytes += Number.isFinite(result.bytes) ? result.bytes : 0;
+      totalDeleted += Number.isFinite(result.deleted) ? result.deleted : 0;
+      totalScanned += Number.isFinite(result.scanned) ? result.scanned : 0;
+      afterId = Number.isFinite(result.next_after_id) ? result.next_after_id : afterId;
+      done = !!result.done;
+      aborted = !!result.aborted;
+      batch += 1;
+
+      statusEl.textContent = deleteItems
+        ? `Trashing featured orphans… scanned ${totalScanned}, trashed ${totalDeleted}`
+        : `Auditing featured orphans… scanned ${totalScanned}, found ${totalCount}`;
+
+      if (aborted) {
+        break;
+      }
+
+      if (!done) await sleep(100);
     }
 
-    if (!r || !r.success) {
-      statusEl.textContent = deleteItems ? 'Featured orphan cleanup error' : 'Featured orphan audit error';
-      setBusy(false);
-      appendLog(['Featured orphan action failed.', JSON.stringify(r)]);
-      if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
-      if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
-      return;
-    }
-
-    const d = r.data || {};
-    const result = d.result || {};
-    appendLog([...(d.log || [])]);
-
-    const count = Number.isFinite(result.count) ? result.count : 0;
-    const bytesHuman = result.bytes_human || '0 B';
-    const deleted = Number.isFinite(result.deleted) ? result.deleted : 0;
+    const bytesHuman = formatBytes(totalBytes);
 
     if (featuredOrphansStatus) {
-      featuredOrphansStatus.textContent = deleteItems
-        ? `Deleted ${deleted} orphaned featured attachments (${bytesHuman}).`
-        : `Found ${count} orphaned featured attachments (${bytesHuman}).`;
+      if (aborted) {
+        featuredOrphansStatus.textContent = 'Featured orphan scan aborted due to an implausibly small reference set.';
+      } else if (deleteItems) {
+        featuredOrphansStatus.textContent = `Trashed ${totalDeleted} orphaned featured attachments (${bytesHuman}).`;
+      } else {
+        featuredOrphansStatus.textContent = `Found ${totalCount} orphaned featured attachments (${bytesHuman}).`;
+      }
     }
 
-    statusEl.textContent = deleteItems ? 'Featured orphan cleanup complete ✅' : 'Featured orphan audit complete ✅';
+    statusEl.textContent = aborted
+      ? 'Featured orphan scan aborted'
+      : (deleteItems ? 'Featured orphan cleanup complete ✅' : 'Featured orphan audit complete ✅');
     setBusy(false);
     if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
     if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
@@ -1294,7 +1347,7 @@
   if (deleteFeaturedOrphansBtn) {
     deleteFeaturedOrphansBtn.addEventListener('click', async function (e) {
       e.preventDefault();
-      const ok = window.confirm('Delete orphaned hostfully-featured attachments that are no longer referenced by any featured image or gallery?');
+      const ok = window.confirm('Trash orphaned hostfully-featured attachments that are no longer referenced elsewhere? You can restore them from Media Trash if needed.');
       if (!ok) return;
       await runFeaturedOrphanCleanup(true);
     });

@@ -3,7 +3,7 @@
 /**
  * Plugin Name: Hostfully → MotoPress Importer
  * Description: Sync Hostfully properties into MotoPress with update-safe reimports.
- * Version: 0.42
+ * Version: 0.43
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -20,6 +20,7 @@ const HOSTFULLY_MPHB_OPT_MAP_AMENITIES = 'hostfully_mphb_map_amenities';
 const HOSTFULLY_MPHB_OPT_ATTR_DEFS = 'hostfully_mphb_attr_defs';
 const HOSTFULLY_MPHB_OPT_LAST_ERROR = 'hostfully_mphb_last_error';
 const HOSTFULLY_MPHB_OPT_LEGACY_BEDROOM_CLEANED = 'hostfully_mphb_legacy_bedroom_cleaned';
+const HOSTFULLY_MPHB_TRANSIENT_FEATURED_REFERENCES = 'hostfully_mphb_featured_references';
 
 // Polyfill for PHP < 8.1
 if (!function_exists('array_is_list')) {
@@ -4088,14 +4089,20 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
             if (!is_wp_error($attach_id) && $attach_id) {
                 $attach_id = (int)$attach_id;
 
-                if ($existing_id > 0 && $existing_id !== $attach_id && get_post_type($existing_id) === 'attachment') {
-                    wp_delete_attachment($existing_id, true);
-                    $log[] = 'Featured replaced: deleted superseded attachment ' . $existing_id;
-                }
-
                 set_post_thumbnail($post_id, $attach_id);
                 update_post_meta($post_id, '_hostfully_featured_id', $attach_id);
                 update_post_meta($post_id, '_hostfully_featured_src', $src_key);
+
+                if ($existing_id > 0 && $existing_id !== $attach_id && get_post_type($existing_id) === 'attachment') {
+                    $reference_snapshot = hostfully_mphb_get_featured_reference_snapshot(true);
+                    if (!hostfully_mphb_attachment_is_referenced($existing_id, $reference_snapshot)) {
+                        wp_delete_attachment($existing_id, false);
+                        $log[] = 'Featured replaced: trashed superseded attachment ' . $existing_id;
+                    } else {
+                        $log[] = 'Featured replaced: kept attachment ' . $existing_id . ' (still referenced elsewhere)';
+                    }
+                }
+
                 $log[] = 'Featured image imported attachment ID: ' . $attach_id;
             }
         }
@@ -4171,7 +4178,10 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
                 $attach_id = (int)$attach_id;
                 $gallery_ids[] = $attach_id;
 
-                if ($photo_uid) $photo_map[$photo_uid] = $attach_id;
+                if ($photo_uid) {
+                    $photo_map[$photo_uid] = $attach_id;
+                    update_post_meta($post_id, '_hostfully_photo_map', $photo_map);
+                }
 
                 $log[] = 'Imported gallery attachment ID: ' . $attach_id;
                 $count++;
@@ -4532,7 +4542,56 @@ function hostfully_mphb_attachment_total_bytes(int $attach_id): int
     return $total;
 }
 
-function hostfully_mphb_get_featured_reference_ids(): array
+function hostfully_mphb_extract_featured_filenames_from_blob($blob, array &$filenames): void
+{
+    if (!is_string($blob) || $blob === '') return;
+
+    if (!preg_match_all('/hostfully-featured-[A-Za-z0-9._-]+\.(?:jpg|jpeg|png|webp)/i', $blob, $matches)) {
+        return;
+    }
+
+    foreach ((array)($matches[0] ?? []) as $filename) {
+        $filename = strtolower((string)$filename);
+        if ($filename !== '') {
+            $filenames[$filename] = true;
+        }
+    }
+}
+
+function hostfully_mphb_collect_referenced_filenames(): array
+{
+    global $wpdb;
+
+    $filenames = [];
+    $blobs = array_merge(
+        (array)$wpdb->get_col(
+            "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_value LIKE '%hostfully-featured-%' AND meta_key NOT IN ('_wp_attached_file', '_wp_attachment_metadata')"
+        ),
+        (array)$wpdb->get_col(
+            "SELECT post_content FROM {$wpdb->posts} WHERE post_content LIKE '%hostfully-featured-%'"
+        ),
+        (array)$wpdb->get_col(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_value LIKE '%hostfully-featured-%'"
+        )
+    );
+
+    if ($wpdb->termmeta) {
+        $blobs = array_merge(
+            $blobs,
+            (array)$wpdb->get_col(
+                "SELECT meta_value FROM {$wpdb->termmeta} WHERE meta_value LIKE '%hostfully-featured-%'"
+            )
+        );
+    }
+
+    foreach ($blobs as $blob) {
+        hostfully_mphb_extract_featured_filenames_from_blob($blob, $filenames);
+    }
+
+    return $filenames;
+}
+
+function hostfully_mphb_build_featured_reference_snapshot(): array
 {
     global $wpdb;
 
@@ -4547,10 +4606,10 @@ function hostfully_mphb_get_featured_reference_ids(): array
     }
 
     $gallery_values = $wpdb->get_col(
-        "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = 'mphb_gallery' AND meta_value <> ''"
+        "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key IN ('mphb_gallery', '_product_image_gallery') AND meta_value <> ''"
     );
     foreach ((array)$gallery_values as $gallery_value) {
-        $gallery_ids = array_filter(array_map('intval', explode(',', (string)$gallery_value)));
+        $gallery_ids = array_filter(array_map('intval', preg_split('/\s*,\s*/', (string)$gallery_value)));
         foreach ($gallery_ids as $gallery_id) {
             $referenced[(int)$gallery_id] = true;
         }
@@ -4570,32 +4629,159 @@ function hostfully_mphb_get_featured_reference_ids(): array
         }
     }
 
-    return $referenced;
+    return [
+        'ids' => $referenced,
+        'filenames' => hostfully_mphb_collect_referenced_filenames(),
+    ];
 }
 
-function hostfully_mphb_get_featured_orphan_scan(array &$log): array
+function hostfully_mphb_get_featured_reference_snapshot(bool $refresh = false): array
 {
-    $attachments = get_posts([
-        'post_type'      => 'attachment',
-        'posts_per_page' => -1,
-        'post_status'    => 'any',
-        'meta_query'     => [
-            [
-                'key'     => '_wp_attached_file',
-                'value'   => 'hostfully-featured-',
-                'compare' => 'LIKE',
-            ],
-        ],
-        'fields' => 'ids',
-    ]);
+    static $snapshot = null;
 
-    $referenced = hostfully_mphb_get_featured_reference_ids();
+    if ($refresh) {
+        $snapshot = null;
+    }
+
+    if (is_array($snapshot)) {
+        return $snapshot;
+    }
+
+    if (!$refresh) {
+        $cached = get_transient(HOSTFULLY_MPHB_TRANSIENT_FEATURED_REFERENCES);
+        if (is_array($cached) && isset($cached['ids'], $cached['filenames']) && is_array($cached['ids']) && is_array($cached['filenames'])) {
+            $snapshot = $cached;
+            return $snapshot;
+        }
+    }
+
+    $snapshot = hostfully_mphb_build_featured_reference_snapshot();
+    set_transient(HOSTFULLY_MPHB_TRANSIENT_FEATURED_REFERENCES, $snapshot, 10 * MINUTE_IN_SECONDS);
+
+    return $snapshot;
+}
+
+function hostfully_mphb_get_featured_reference_ids(): array
+{
+    $snapshot = hostfully_mphb_get_featured_reference_snapshot();
+    return is_array($snapshot['ids'] ?? null) ? $snapshot['ids'] : [];
+}
+
+function hostfully_mphb_get_referenced_filenames(): array
+{
+    $snapshot = hostfully_mphb_get_featured_reference_snapshot();
+    return is_array($snapshot['filenames'] ?? null) ? $snapshot['filenames'] : [];
+}
+
+function hostfully_mphb_get_attachment_reference_basenames(int $attach_id): array
+{
+    $basenames = [];
+
+    $attached_file = get_attached_file($attach_id);
+    if (is_string($attached_file) && $attached_file !== '') {
+        $basenames[strtolower(basename($attached_file))] = true;
+    }
+
+    $meta = wp_get_attachment_metadata($attach_id);
+    if (is_array($meta)) {
+        if (!empty($meta['original_image']) && is_string($meta['original_image'])) {
+            $basenames[strtolower(basename($meta['original_image']))] = true;
+        }
+
+        if (!empty($meta['sizes']) && is_array($meta['sizes'])) {
+            foreach ($meta['sizes'] as $size_meta) {
+                $size_file = is_array($size_meta) ? (string)($size_meta['file'] ?? '') : '';
+                if ($size_file !== '') {
+                    $basenames[strtolower(basename($size_file))] = true;
+                }
+            }
+        }
+    }
+
+    return array_keys($basenames);
+}
+
+function hostfully_mphb_attachment_is_referenced(int $attach_id, ?array $snapshot = null): bool
+{
+    if ($attach_id < 1) return false;
+
+    $snapshot = is_array($snapshot) ? $snapshot : hostfully_mphb_get_featured_reference_snapshot();
+    $referenced_ids = is_array($snapshot['ids'] ?? null) ? $snapshot['ids'] : [];
+    if (isset($referenced_ids[$attach_id])) {
+        return true;
+    }
+
+    $referenced_filenames = is_array($snapshot['filenames'] ?? null) ? $snapshot['filenames'] : [];
+    foreach (hostfully_mphb_get_attachment_reference_basenames($attach_id) as $basename) {
+        if (isset($referenced_filenames[strtolower($basename)])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function hostfully_mphb_get_featured_attachment_batch_ids(int $after_id, int $limit): array
+{
+    global $wpdb;
+
+    $after_id = max(0, $after_id);
+    $limit = max(1, min(500, $limit));
+
+    $sql = $wpdb->prepare(
+        "SELECT p.ID
+         FROM {$wpdb->posts} p
+         INNER JOIN {$wpdb->postmeta} pm
+             ON pm.post_id = p.ID
+            AND pm.meta_key = '_wp_attached_file'
+            AND pm.meta_value LIKE %s
+         WHERE p.post_type = 'attachment'
+           AND p.post_status <> 'trash'
+           AND p.ID > %d
+         ORDER BY p.ID ASC
+         LIMIT %d",
+        '%hostfully-featured-%',
+        $after_id,
+        $limit
+    );
+
+    return array_values(array_filter(array_map('intval', (array)$wpdb->get_col($sql))));
+}
+
+function hostfully_mphb_get_featured_orphan_scan(int $after_id, array &$log, int $limit = 200, bool $refresh_refs = false): array
+{
+    $reference_snapshot = hostfully_mphb_get_featured_reference_snapshot($refresh_refs);
+    $referenced = is_array($reference_snapshot['ids'] ?? null) ? $reference_snapshot['ids'] : [];
+    $counts = wp_count_posts('mphb_room_type');
+    $publish_count = is_object($counts) ? (int)($counts->publish ?? 0) : 0;
+    $expected_floor = max(10, $publish_count);
+
+    if (count($referenced) < $expected_floor) {
+        $log[] = 'ABORT: reference set implausibly small (' . count($referenced) . ' < ' . $expected_floor . '). Refusing to classify orphans.';
+        return [
+            'items' => [],
+            'count' => 0,
+            'bytes' => 0,
+            'bytes_human' => '0 B',
+            'scanned' => 0,
+            'next_after_id' => max(0, $after_id),
+            'done' => true,
+            'aborted' => true,
+        ];
+    }
+
+    $limit = max(1, min(500, $limit));
+    $attachments = hostfully_mphb_get_featured_attachment_batch_ids($after_id, $limit);
     $orphans = [];
     $total_bytes = 0;
+    $last_id = max(0, $after_id);
 
     foreach ($attachments as $attach_id) {
         $attach_id = (int)$attach_id;
-        if ($attach_id < 1 || isset($referenced[$attach_id])) continue;
+        if ($attach_id < 1) continue;
+
+        $last_id = $attach_id;
+        if (hostfully_mphb_attachment_is_referenced($attach_id, $reference_snapshot)) continue;
 
         $file = (string)get_post_meta($attach_id, '_wp_attached_file', true);
         $bytes = hostfully_mphb_attachment_total_bytes($attach_id);
@@ -4607,25 +4793,34 @@ function hostfully_mphb_get_featured_orphan_scan(array &$log): array
         ];
     }
 
-    $log[] = 'Featured orphan audit: found ' . count($orphans) . ' attachments totaling ' . hostfully_mphb_format_bytes($total_bytes) . '.';
+    $log[] = 'Featured orphan audit batch: scanned ' . count($attachments) . ' attachments, found ' . count($orphans) . ' candidates totaling ' . hostfully_mphb_format_bytes($total_bytes) . '.';
 
     return [
         'items' => $orphans,
         'count' => count($orphans),
         'bytes' => $total_bytes,
         'bytes_human' => hostfully_mphb_format_bytes($total_bytes),
+        'scanned' => count($attachments),
+        'next_after_id' => $last_id,
+        'done' => count($attachments) < $limit,
+        'aborted' => false,
     ];
 }
 
-function hostfully_mphb_cleanup_featured_orphans(bool $delete, array &$log): array
+function hostfully_mphb_cleanup_featured_orphans(bool $delete, int $after_id, int $limit, array &$log, bool $refresh_refs = false): array
 {
-    $scan = hostfully_mphb_get_featured_orphan_scan($log);
-    if (!$delete || empty($scan['items'])) {
+    $scan = hostfully_mphb_get_featured_orphan_scan($after_id, $log, $limit, $refresh_refs);
+    if (!empty($scan['aborted']) || !$delete || empty($scan['items'])) {
         return [
             'deleted' => 0,
+            'trashed' => 0,
             'count' => (int)$scan['count'],
             'bytes' => (int)$scan['bytes'],
             'bytes_human' => (string)$scan['bytes_human'],
+            'scanned' => (int)($scan['scanned'] ?? 0),
+            'next_after_id' => (int)($scan['next_after_id'] ?? $after_id),
+            'done' => !empty($scan['done']),
+            'aborted' => !empty($scan['aborted']),
         ];
     }
 
@@ -4633,20 +4828,25 @@ function hostfully_mphb_cleanup_featured_orphans(bool $delete, array &$log): arr
     foreach ($scan['items'] as $item) {
         $attach_id = (int)($item['id'] ?? 0);
         if ($attach_id < 1) continue;
-        wp_delete_attachment($attach_id, true);
-        $deleted++;
+        if (wp_delete_attachment($attach_id, false)) {
+            $deleted++;
+        }
     }
 
-    $log[] = 'Featured orphan cleanup: deleted ' . $deleted . ' attachments totaling ' . (string)$scan['bytes_human'] . '.';
+    $log[] = 'Featured orphan cleanup batch: trashed ' . $deleted . ' attachments totaling ' . (string)$scan['bytes_human'] . '.';
 
     return [
         'deleted' => $deleted,
+        'trashed' => $deleted,
         'count' => (int)$scan['count'],
         'bytes' => (int)$scan['bytes'],
         'bytes_human' => (string)$scan['bytes_human'],
+        'scanned' => (int)($scan['scanned'] ?? 0),
+        'next_after_id' => (int)($scan['next_after_id'] ?? $after_id),
+        'done' => !empty($scan['done']),
+        'aborted' => false,
     ];
 }
-
 function hostfully_mphb_cleanup_attribute_registry(array &$log): int
 {
     $reg = hostfully_mphb_get_attribute_registry();
@@ -6206,8 +6406,11 @@ add_action('wp_ajax_hostfully_mphb_cleanup_featured_orphans', function () {
     check_ajax_referer('hostfully_mphb_ajax', 'nonce');
 
     $delete = !empty($_POST['delete']);
+    $after_id = isset($_POST['after_id']) ? max(0, (int)$_POST['after_id']) : 0;
+    $limit = isset($_POST['limit']) ? max(1, min(500, (int)$_POST['limit'])) : 200;
+    $refresh_refs = !empty($_POST['refresh_refs']);
     $log = [];
-    $result = hostfully_mphb_cleanup_featured_orphans($delete, $log);
+    $result = hostfully_mphb_cleanup_featured_orphans($delete, $after_id, $limit, $log, $refresh_refs);
 
     wp_send_json_success([
         'result' => $result,
