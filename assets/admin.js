@@ -65,6 +65,9 @@
   const icalLinkTable = document.getElementById('hostfully-ical-link-table');
   const icalLinkLog = document.getElementById('hostfully-ical-link-log');
   const cleanupBtn = document.getElementById('hostfully-cleanup-terms');
+  const auditFeaturedOrphansBtn = document.getElementById('hostfully-audit-featured-orphans');
+  const deleteFeaturedOrphansBtn = document.getElementById('hostfully-delete-featured-orphans');
+  const featuredOrphansStatus = document.getElementById('hostfully-featured-orphans-status');
   const wrapEl = document.querySelector('.wrap[data-next-action]');
   const nextActionStep = wrapEl ? wrapEl.getAttribute('data-next-action') : '';
   const detailEls = document.querySelectorAll('details[data-step]');
@@ -1226,6 +1229,74 @@
       statusEl.textContent = 'Cleanup complete ✅';
       setBusy(false);
       cleanupBtn.disabled = false;
+    });
+  }
+
+  async function runFeaturedOrphanCleanup(deleteItems) {
+    wrap.style.display = 'block';
+    logEl.textContent = '';
+    setBusy(true);
+    resetCounter();
+    statusEl.textContent = deleteItems ? 'Deleting featured orphans…' : 'Auditing featured orphans…';
+
+    if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = true;
+    if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = true;
+
+    let r = null;
+    try {
+      r = await post('hostfully_mphb_cleanup_featured_orphans', {
+        delete: deleteItems ? '1' : '0',
+      });
+      if (r && r.success) markJsOk();
+    } catch (err) {
+      showError(deleteItems ? 'Featured orphan cleanup failed' : 'Featured orphan audit failed', err);
+      if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
+      if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
+      return;
+    }
+
+    if (!r || !r.success) {
+      statusEl.textContent = deleteItems ? 'Featured orphan cleanup error' : 'Featured orphan audit error';
+      setBusy(false);
+      appendLog(['Featured orphan action failed.', JSON.stringify(r)]);
+      if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
+      if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
+      return;
+    }
+
+    const d = r.data || {};
+    const result = d.result || {};
+    appendLog([...(d.log || [])]);
+
+    const count = Number.isFinite(result.count) ? result.count : 0;
+    const bytesHuman = result.bytes_human || '0 B';
+    const deleted = Number.isFinite(result.deleted) ? result.deleted : 0;
+
+    if (featuredOrphansStatus) {
+      featuredOrphansStatus.textContent = deleteItems
+        ? `Deleted ${deleted} orphaned featured attachments (${bytesHuman}).`
+        : `Found ${count} orphaned featured attachments (${bytesHuman}).`;
+    }
+
+    statusEl.textContent = deleteItems ? 'Featured orphan cleanup complete ✅' : 'Featured orphan audit complete ✅';
+    setBusy(false);
+    if (auditFeaturedOrphansBtn) auditFeaturedOrphansBtn.disabled = false;
+    if (deleteFeaturedOrphansBtn) deleteFeaturedOrphansBtn.disabled = false;
+  }
+
+  if (auditFeaturedOrphansBtn) {
+    auditFeaturedOrphansBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      await runFeaturedOrphanCleanup(false);
+    });
+  }
+
+  if (deleteFeaturedOrphansBtn) {
+    deleteFeaturedOrphansBtn.addEventListener('click', async function (e) {
+      e.preventDefault();
+      const ok = window.confirm('Delete orphaned hostfully-featured attachments that are no longer referenced by any featured image or gallery?');
+      if (!ok) return;
+      await runFeaturedOrphanCleanup(true);
     });
   }
 

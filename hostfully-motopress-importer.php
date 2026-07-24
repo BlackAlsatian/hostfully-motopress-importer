@@ -1,9 +1,9 @@
 <?php
 
 /**
- * Plugin Name: Hostfully → MotoPress Importer (Temporary)
- * Description: One-time importer for Hostfully properties into MotoPress.
- * Version: 0.40
+ * Plugin Name: Hostfully → MotoPress Importer
+ * Description: Sync Hostfully properties into MotoPress with update-safe reimports.
+ * Version: 0.41
  * Author: Black Alsatian
  * Author URI: https://www.blackalsatian.co.za
  * Plugin URI: https://www.blackalsatian.co.za
@@ -2117,6 +2117,19 @@ function hostfully_mphb_sideload_image(string $url, int $parent_post_id, string 
     return (int)$attach_id;
 }
 
+function hostfully_mphb_featured_src_key(string $url): string
+{
+    $parts = wp_parse_url($url);
+    if (!is_array($parts) || empty($parts['path'])) {
+        return $url;
+    }
+
+    $scheme = strtolower((string)($parts['scheme'] ?? 'https'));
+    $host = strtolower((string)($parts['host'] ?? ''));
+
+    return $scheme . '://' . $host . $parts['path'];
+}
+
 /**
  * =================
  * TAXONOMY IMPORT (Amenities / Tags / etc.)
@@ -4044,20 +4057,47 @@ function hostfully_mphb_import_property(string $property_uid, array &$log): int
     hostfully_mphb_import_services((int)$post_id, $property, $log);
 
     // 6) Featured image
-    $picture_url = $property['pictureLink'] ?? '';
+    $picture_url = trim((string)($property['pictureLink'] ?? ''));
     if ($picture_url) {
         $log[] = 'Featured image URL: ' . $picture_url;
 
-        $attach_id = hostfully_mphb_sideload_image(
-            $picture_url,
-            $post_id,
-            'hostfully-featured-' . ($property['uid'] ?? uniqid()) . '.jpg',
-            $log
-        );
+        $featured_uid = (string)($property['uid'] ?? '');
+        $existing_id = (int)get_post_meta($post_id, '_hostfully_featured_id', true);
+        $existing_src = (string)get_post_meta($post_id, '_hostfully_featured_src', true);
+        $src_key = hostfully_mphb_featured_src_key($picture_url);
+        $existing_attachment = $existing_id > 0 ? get_post($existing_id) : null;
 
-        if (!is_wp_error($attach_id) && $attach_id) {
-            set_post_thumbnail($post_id, (int)$attach_id);
-            $log[] = 'Featured image imported attachment ID: ' . (int)$attach_id;
+        $still_valid = $existing_attachment
+            && $existing_attachment->post_type === 'attachment'
+            && $existing_src === $src_key;
+
+        if ($still_valid) {
+            if ((int)get_post_thumbnail_id($post_id) !== $existing_id) {
+                set_post_thumbnail($post_id, $existing_id);
+                $log[] = 'Featured image restored from stored attachment ID: ' . $existing_id;
+            }
+            $log[] = 'Featured skip (already imported): attachment ' . $existing_id;
+        } else {
+            $attach_id = hostfully_mphb_sideload_image(
+                $picture_url,
+                $post_id,
+                'hostfully-featured-' . ($featured_uid !== '' ? $featured_uid : uniqid()) . '.jpg',
+                $log
+            );
+
+            if (!is_wp_error($attach_id) && $attach_id) {
+                $attach_id = (int)$attach_id;
+
+                if ($existing_id > 0 && $existing_id !== $attach_id && get_post_type($existing_id) === 'attachment') {
+                    wp_delete_attachment($existing_id, true);
+                    $log[] = 'Featured replaced: deleted superseded attachment ' . $existing_id;
+                }
+
+                set_post_thumbnail($post_id, $attach_id);
+                update_post_meta($post_id, '_hostfully_featured_id', $attach_id);
+                update_post_meta($post_id, '_hostfully_featured_src', $src_key);
+                $log[] = 'Featured image imported attachment ID: ' . $attach_id;
+            }
         }
     } else {
         $log[] = 'Featured image URL: (none provided by Hostfully)';
@@ -4437,6 +4477,160 @@ function hostfully_mphb_cleanup_orphan_media(array &$log): int
 
     $log[] = 'Cleanup orphan media: deleted ' . $deleted . '.';
     return $deleted;
+}
+
+function hostfully_mphb_format_bytes(int $bytes): string
+{
+    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    $size = max(0, $bytes);
+    $idx = 0;
+
+    while ($size >= 1024 && $idx < count($units) - 1) {
+        $size /= 1024;
+        $idx++;
+    }
+
+    return number_format($size, $idx === 0 ? 0 : 2) . ' ' . $units[$idx];
+}
+
+function hostfully_mphb_attachment_total_bytes(int $attach_id): int
+{
+    $paths = [];
+    $attached_file = get_attached_file($attach_id);
+    if (is_string($attached_file) && $attached_file !== '') {
+        $paths[$attached_file] = true;
+    }
+
+    $meta = wp_get_attachment_metadata($attach_id);
+    if (is_array($meta) && !empty($attached_file)) {
+        $base_dir = trailingslashit(dirname($attached_file));
+
+        if (!empty($meta['original_image']) && is_string($meta['original_image'])) {
+            $paths[$base_dir . $meta['original_image']] = true;
+        }
+
+        if (!empty($meta['sizes']) && is_array($meta['sizes'])) {
+            foreach ($meta['sizes'] as $size_meta) {
+                $size_file = is_array($size_meta) ? (string)($size_meta['file'] ?? '') : '';
+                if ($size_file !== '') {
+                    $paths[$base_dir . $size_file] = true;
+                }
+            }
+        }
+    }
+
+    $total = 0;
+    foreach (array_keys($paths) as $path) {
+        if (is_string($path) && $path !== '' && file_exists($path)) {
+            $size = filesize($path);
+            if ($size !== false) {
+                $total += (int)$size;
+            }
+        }
+    }
+
+    return $total;
+}
+
+function hostfully_mphb_get_featured_reference_ids(): array
+{
+    global $wpdb;
+
+    $referenced = [];
+
+    $thumbnail_ids = $wpdb->get_col(
+        "SELECT DISTINCT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_thumbnail_id' AND meta_value <> ''"
+    );
+    foreach ((array)$thumbnail_ids as $thumb_id) {
+        $thumb_id = (int)$thumb_id;
+        if ($thumb_id > 0) $referenced[$thumb_id] = true;
+    }
+
+    $gallery_values = $wpdb->get_col(
+        "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = 'mphb_gallery' AND meta_value <> ''"
+    );
+    foreach ((array)$gallery_values as $gallery_value) {
+        $gallery_ids = array_filter(array_map('intval', explode(',', (string)$gallery_value)));
+        foreach ($gallery_ids as $gallery_id) {
+            $referenced[(int)$gallery_id] = true;
+        }
+    }
+
+    return $referenced;
+}
+
+function hostfully_mphb_get_featured_orphan_scan(array &$log): array
+{
+    $attachments = get_posts([
+        'post_type'      => 'attachment',
+        'posts_per_page' => -1,
+        'post_status'    => 'any',
+        'meta_query'     => [
+            [
+                'key'     => '_wp_attached_file',
+                'value'   => 'hostfully-featured-',
+                'compare' => 'LIKE',
+            ],
+        ],
+        'fields' => 'ids',
+    ]);
+
+    $referenced = hostfully_mphb_get_featured_reference_ids();
+    $orphans = [];
+    $total_bytes = 0;
+
+    foreach ($attachments as $attach_id) {
+        $attach_id = (int)$attach_id;
+        if ($attach_id < 1 || isset($referenced[$attach_id])) continue;
+
+        $file = (string)get_post_meta($attach_id, '_wp_attached_file', true);
+        $bytes = hostfully_mphb_attachment_total_bytes($attach_id);
+        $total_bytes += $bytes;
+        $orphans[] = [
+            'id' => $attach_id,
+            'file' => $file,
+            'bytes' => $bytes,
+        ];
+    }
+
+    $log[] = 'Featured orphan audit: found ' . count($orphans) . ' attachments totaling ' . hostfully_mphb_format_bytes($total_bytes) . '.';
+
+    return [
+        'items' => $orphans,
+        'count' => count($orphans),
+        'bytes' => $total_bytes,
+        'bytes_human' => hostfully_mphb_format_bytes($total_bytes),
+    ];
+}
+
+function hostfully_mphb_cleanup_featured_orphans(bool $delete, array &$log): array
+{
+    $scan = hostfully_mphb_get_featured_orphan_scan($log);
+    if (!$delete || empty($scan['items'])) {
+        return [
+            'deleted' => 0,
+            'count' => (int)$scan['count'],
+            'bytes' => (int)$scan['bytes'],
+            'bytes_human' => (string)$scan['bytes_human'],
+        ];
+    }
+
+    $deleted = 0;
+    foreach ($scan['items'] as $item) {
+        $attach_id = (int)($item['id'] ?? 0);
+        if ($attach_id < 1) continue;
+        wp_delete_attachment($attach_id, true);
+        $deleted++;
+    }
+
+    $log[] = 'Featured orphan cleanup: deleted ' . $deleted . ' attachments totaling ' . (string)$scan['bytes_human'] . '.';
+
+    return [
+        'deleted' => $deleted,
+        'count' => (int)$scan['count'],
+        'bytes' => (int)$scan['bytes'],
+        'bytes_human' => (string)$scan['bytes_human'],
+    ];
 }
 
 function hostfully_mphb_cleanup_attribute_registry(array &$log): int
@@ -4992,7 +5186,13 @@ function hostfully_mphb_render_admin()
                         <button id="hostfully-sync-name-aliases" class="button" style="margin-left:8px;" title="Backfill raw Hostfully property names and description names on existing imports so spreadsheet matching works without rerunning the full bulk importer.">Sync Name Aliases</button>
                         <button id="hostfully-cleanup-terms" class="button" style="margin-left:8px;" title="Remove unused taxonomy terms and delete orphaned importer artifacts such as rates, rooms, services, media, and stale attribute-registry entries.">Run Cleanup</button>
                     </p>
+                    <p>
+                        <button id="hostfully-audit-featured-orphans" class="button" title="Dry-run scan for orphaned hostfully-featured attachments that are no longer referenced by any featured image or gallery.">Audit Featured Orphans</button>
+                        <button id="hostfully-delete-featured-orphans" class="button" style="margin-left:8px;" title="Delete orphaned hostfully-featured attachments after reviewing the dry-run audit.">Delete Featured Orphans</button>
+                        <span id="hostfully-featured-orphans-status" style="margin-left:8px; color:#666;"></span>
+                    </p>
                     <p class="description" style="margin:6px 0 0; max-width:900px;">Use these only when you need one specific maintenance action. For routine operations, prefer the main Post-Import Sync. Cleanup is best reserved for housekeeping after significant import changes or removals.</p>
+                    <p class="description" style="margin:6px 0 0; max-width:900px;">Featured orphan audit is dry-run first: it reports how many old <code>hostfully-featured-*</code> attachments are no longer referenced, plus their total disk usage, before you choose to delete them.</p>
                 </div>
 
                 <div style="background:#fff; border:1px solid #ccd0d4; padding:12px; margin-bottom:12px;">
@@ -5980,6 +6180,20 @@ add_action('wp_ajax_hostfully_mphb_cleanup_terms', function () {
     if (!empty($opts['unpublish_missing'])) {
         $result['unpublish_missing'] = hostfully_mphb_unpublish_missing_properties($log);
     }
+
+    wp_send_json_success([
+        'result' => $result,
+        'log' => $log,
+    ]);
+});
+
+add_action('wp_ajax_hostfully_mphb_cleanup_featured_orphans', function () {
+    if (!current_user_can('manage_options')) wp_send_json_error(['message' => 'No permission.'], 403);
+    check_ajax_referer('hostfully_mphb_ajax', 'nonce');
+
+    $delete = !empty($_POST['delete']);
+    $log = [];
+    $result = hostfully_mphb_cleanup_featured_orphans($delete, $log);
 
     wp_send_json_success([
         'result' => $result,
